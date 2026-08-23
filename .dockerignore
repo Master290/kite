@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.vscode
+node_modules
+sdk/node_modules
+sdk/dist
+web/dist
+dist
+coverage.out
+*.log
+

@@ -1,0 +1,17 @@
+/kite
+/kite.exe
+*.exe~
+/dist/
+/coverage.out
+node_modules/
+/sdk/dist/
+/web/dist/
+/.idea/
+/.vscode/
+*.log
+*.err
+*.pem
+*.key
+.env
+/testdata/e2e.*
+/testdata/*-e2e.*

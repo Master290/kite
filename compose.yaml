@@ -1,0 +1,16 @@
+services:
+  kite:
+    build: .
+    ports:
+      - "8443:8443/tcp"
+      - "8443:8443/udp"
+    environment:
+      KITE_SOURCE_PASSWORD: change-me
+      KITE_ADMIN_TOKEN: change-admin-token
+    volumes:
+      - ./kite.example.yaml:/var/lib/kite/kite.yaml
+      - kite-data:/var/lib/kite
+    restart: unless-stopped
+
+volumes:
+  kite-data:
