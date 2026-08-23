@@ -423,7 +423,11 @@ func (c *Config) Paths() []string {
 }
 
 func (c *Config) StaticKey() string {
-	return strings.Join([]string{c.Server.HTTPAddress, c.Server.HTTPSAddress, c.Server.HTTP3Address, c.Admin.Address, c.TLS.Mode, c.TLS.CacheDirectory, c.TLS.HTTPChallengeAddress}, "\x00")
+	return strings.Join([]string{
+		c.Server.HTTPAddress, c.Server.HTTPSAddress, c.Server.HTTP3Address, fmt.Sprint(c.Server.PublicHTTPSPort),
+		c.Server.ReadHeaderTimeout.Duration().String(), c.Server.IdleTimeout.Duration().String(), c.Server.ShutdownTimeout.Duration().String(), fmt.Sprint(c.Server.MaxHeaderBytes), strings.Join(c.Server.TrustedProxyNetworks, ","),
+		c.Admin.Address, c.TLS.Mode, strings.Join(c.TLS.Hosts, ","), c.TLS.Email, c.TLS.CacheDirectory, c.TLS.CertificateFile, c.TLS.PrivateKeyFile, c.TLS.HTTPChallengeAddress, c.TLS.ACMEDirectoryURL,
+	}, "\x00")
 }
 
 func ResolveSecret(envName, fileName string) ([]byte, error) {

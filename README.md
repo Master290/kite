@@ -16,6 +16,7 @@ The project is an early implementation. Its current focus is a dependable single
 - Development TLS, hot-reloaded certificate files, or built-in ACME.
 - Atomic YAML configuration updates with revision ETags.
 - Prometheus metrics on a separate control-plane listener.
+- Shared byte-bounded ring per mount; listeners keep cursors instead of private audio queues.
 - TypeScript browser SDK and a small demo player.
 
 Kite does not transcode audio. Browser playback depends on codec support in the browser. HLS/DASH, AutoDJ scheduling, listener authentication, clustering, and Shoutcast DSP ingest are not part of the current release.
@@ -107,6 +108,7 @@ The control plane binds to loopback by default. Send `Authorization: Bearer $KIT
 - `DELETE /api/v1/source?mount=/radio` — disconnect the active source.
 - `GET /metrics` — Prometheus exposition.
 - `GET /healthz` — process health.
+- `GET /readyz` — listener readiness.
 
 Changes to listener addresses, admin bind address, or TLS mode require a restart and return HTTP `409`. Mounts, credentials, metadata, fallbacks, timeouts, buffers, and CORS rules are applied live.
 

@@ -37,7 +37,7 @@ func (s *ConfigStore) Parse(body []byte) (*config.Config, error) {
 	return config.Parse(body, s.baseDir)
 }
 
-func (s *ConfigStore) Commit(next *config.Config, apply func(*config.Config) error) (uint64, error) {
+func (s *ConfigStore) Commit(next *config.Config, prepare func(*config.Config) error, activate func(*config.Config)) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if next.StaticKey() != s.current.Load().StaticKey() {
@@ -47,12 +47,15 @@ func (s *ConfigStore) Commit(next *config.Config, apply func(*config.Config) err
 	if err != nil {
 		return s.revision.Load(), err
 	}
+	if prepare != nil {
+		if err := prepare(next); err != nil {
+			return s.revision.Load(), fmt.Errorf("prepare config: %w", err)
+		}
+	}
 	if err := atomicWrite(s.path, b, 0o600); err != nil {
 		return s.revision.Load(), err
 	}
-	if err := apply(next); err != nil {
-		return s.revision.Load(), fmt.Errorf("apply config: %w", err)
-	}
+	activate(next)
 	s.current.Store(next)
 	rev := s.revision.Add(1)
 	s.etag.Store(hashConfig(next))

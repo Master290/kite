@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Master290/kite/internal/config"
@@ -15,6 +14,7 @@ import (
 
 var ErrSourceBusy = errors.New("source already connected")
 var ErrSlowListener = errors.New("listener fell behind the live buffer")
+var ErrSubscriptionClosed = errors.New("listener subscription closed")
 
 type Event struct {
 	ID      uint64         `json:"id"`
@@ -118,16 +118,68 @@ func (h *Hub) Status() []Status {
 }
 
 type subscription struct {
-	C      <-chan Chunk
-	cancel func(string)
+	mount     *Mount
+	id        uint64
+	transport string
 }
 
-func (s subscription) Close(reason string) { s.cancel(reason) }
+func (s subscription) Close(reason string) { s.mount.removeListener(s.id, reason) }
+
+func (s subscription) Next(ctx context.Context) (Chunk, error) {
+	path := s.mount.Config().Path
+	for {
+		s.mount.mu.Lock()
+		listener, ok := s.mount.listeners[s.id]
+		if !ok {
+			s.mount.mu.Unlock()
+			return Chunk{}, ErrSubscriptionClosed
+		}
+		if listener.preludeIndex < len(listener.prelude) {
+			data := listener.prelude[listener.preludeIndex]
+			listener.preludeIndex++
+			s.mount.mu.Unlock()
+			return Chunk{Data: data, At: time.Now()}, nil
+		}
+		if len(s.mount.ring) > 0 && listener.cursor < s.mount.ringFirst {
+			delete(s.mount.listeners, s.id)
+			s.mount.mu.Unlock()
+			s.mount.observer.ListenerClosed(path, listener.transport, "slow")
+			return Chunk{}, ErrSlowListener
+		}
+		if len(s.mount.ring) > 0 && listener.cursor >= s.mount.ringFirst && listener.cursor <= s.mount.sequence {
+			index := listener.cursor - s.mount.ringFirst
+			if index < uint64(len(s.mount.ring)) {
+				chunk := s.mount.ring[index]
+				listener.cursor++
+				s.mount.mu.Unlock()
+				return chunk, nil
+			}
+		}
+		notify := s.mount.notify
+		s.mount.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return Chunk{}, ctx.Err()
+		case <-notify:
+		}
+	}
+}
+
+func (s subscription) RecordWrite(n int) {
+	if n <= 0 || s.transport == "fallback" {
+		return
+	}
+	s.mount.mu.Lock()
+	s.mount.bytesOut += uint64(n)
+	s.mount.mu.Unlock()
+	s.mount.observer.BytesOut(s.mount.Config().Path, s.transport, n)
+}
 
 type listener struct {
-	ch        chan Chunk
-	transport string
-	closed    atomic.Bool
+	cursor       uint64
+	transport    string
+	prelude      [][]byte
+	preludeIndex int
 }
 
 type ingest struct {
@@ -146,7 +198,6 @@ type Mount struct {
 	defaults config.Defaults
 
 	primary chan ingest
-	events  chan Event
 
 	mu           sync.RWMutex
 	listeners    map[uint64]*listener
@@ -154,6 +205,10 @@ type Mount struct {
 	eventHistory []Event
 	nextID       uint64
 	sequence     uint64
+	ring         []Chunk
+	ringFirst    uint64
+	ringBytes    int
+	notify       chan struct{}
 	eventID      uint64
 	source       bool
 	sourceSince  time.Time
@@ -169,24 +224,33 @@ type Mount struct {
 }
 
 type Status struct {
-	Path        string    `json:"path"`
-	Profile     string    `json:"profile"`
-	ContentType string    `json:"content_type"`
-	Source      bool      `json:"source_connected"`
-	Active      string    `json:"active_source"`
-	Listeners   int       `json:"listeners"`
-	Metadata    Metadata  `json:"metadata"`
-	LastSource  time.Time `json:"last_source_at,omitempty"`
-	BytesIn     uint64    `json:"bytes_in"`
-	BytesOut    uint64    `json:"bytes_out"`
+	Path           string    `json:"path"`
+	Profile        string    `json:"profile"`
+	ContentType    string    `json:"content_type"`
+	Source         bool      `json:"source_connected"`
+	Active         string    `json:"active_source"`
+	Listeners      int       `json:"listeners"`
+	Metadata       Metadata  `json:"metadata"`
+	LastSource     time.Time `json:"last_source_at,omitempty"`
+	BytesIn        uint64    `json:"bytes_in"`
+	BytesOut       uint64    `json:"bytes_out"`
+	BufferBytes    int       `json:"buffer_bytes"`
+	BufferLimit    int       `json:"buffer_limit_bytes"`
+	OldestSequence uint64    `json:"oldest_sequence"`
+	LatestSequence uint64    `json:"latest_sequence"`
 }
 
 func newMount(parent context.Context, hub *Hub, cfg config.Mount, defaults config.Defaults, observer Observer) *Mount {
 	ctx, cancel := context.WithCancel(parent)
 	m := &Mount{
 		hub: hub, observer: observer, ctx: ctx, cancel: cancel, cfg: cfg, defaults: defaults,
-		primary: make(chan ingest, 256), events: make(chan Event, 32), listeners: make(map[uint64]*listener),
-		eventSubs: make(map[uint64]chan Event), sourceGuard: make(chan struct{}, 1), active: "silence",
+		primary: make(chan ingest, 256), listeners: make(map[uint64]*listener),
+		eventSubs: make(map[uint64]chan Event), sourceGuard: make(chan struct{}, 1), active: "silence", notify: make(chan struct{}),
+	}
+	m.eventID = 2
+	m.eventHistory = []Event{
+		{ID: 1, Type: "source", Mount: cfg.Path, Time: time.Now(), Payload: map[string]any{"connected": false, "active": "silence"}},
+		{ID: 2, Type: "metadata", Mount: cfg.Path, Time: time.Now(), Payload: map[string]any{"title": "", "url": ""}},
 	}
 	go m.run()
 	return m
@@ -195,6 +259,11 @@ func newMount(parent context.Context, hub *Hub, cfg config.Mount, defaults confi
 func (m *Mount) stop()                { m.cancel() }
 func (m *Mount) Profile() string      { m.cfgMu.RLock(); defer m.cfgMu.RUnlock(); return m.cfg.Profile }
 func (m *Mount) Config() config.Mount { m.cfgMu.RLock(); defer m.cfgMu.RUnlock(); return m.cfg }
+func (m *Mount) settings() (config.Mount, config.Defaults) {
+	m.cfgMu.RLock()
+	defer m.cfgMu.RUnlock()
+	return m.cfg, m.defaults
+}
 func (m *Mount) Update(cfg config.Mount, defaults config.Defaults) {
 	m.cfgMu.Lock()
 	m.cfg = cfg
@@ -292,47 +361,42 @@ func (m *Mount) Subscribe(transport string) subscription {
 	m.mu.Lock()
 	m.nextID++
 	id := m.nextID
-	buffer := listenerBuffer(m.Config(), m.defaults)
-	l := &listener{ch: make(chan Chunk, buffer), transport: transport}
-	m.listeners[id] = l
-	for _, init := range m.initChunks {
-		l.ch <- Chunk{Data: append([]byte(nil), init...), At: time.Now()}
+	prelude := make([][]byte, len(m.initChunks))
+	for i := range m.initChunks {
+		prelude[i] = append([]byte(nil), m.initChunks[i]...)
 	}
+	l := &listener{cursor: m.sequence + 1, transport: transport, prelude: prelude}
+	m.listeners[id] = l
 	m.mu.Unlock()
 	m.observer.ListenerOpened(m.Config().Path, transport)
-	var once sync.Once
-	return subscription{C: l.ch, cancel: func(reason string) {
-		once.Do(func() {
-			removed := false
-			m.mu.Lock()
-			if current, ok := m.listeners[id]; ok {
-				delete(m.listeners, id)
-				current.closed.Store(true)
-				close(current.ch)
-				removed = true
-			}
-			m.mu.Unlock()
-			if removed {
-				m.observer.ListenerClosed(m.Config().Path, transport, reason)
-			}
-		})
-	}}
+	return subscription{mount: m, id: id, transport: transport}
 }
 
-func listenerBuffer(cfg config.Mount, defaults config.Defaults) int {
+func bufferBytes(cfg config.Mount, defaults config.Defaults) int {
 	bitrate := cfg.Metadata.Bitrate
 	if bitrate <= 0 {
 		bitrate = defaults.MaxSourceBitrate
 	}
-	seconds := cfg.BufferDuration.Duration().Seconds()
-	chunks := int((float64(bitrate)/8*seconds)/16384) + 2
-	if chunks < 4 {
-		chunks = 4
+	bytes := int(float64(bitrate) / 8 * cfg.BufferDuration.Duration().Seconds())
+	if bytes < 16<<10 {
+		bytes = 16 << 10
 	}
-	if chunks > 256 {
-		chunks = 256
+	if bytes > 64<<20 {
+		bytes = 64 << 20
 	}
-	return chunks
+	return bytes
+}
+
+func (m *Mount) removeListener(id uint64, reason string) {
+	m.mu.Lock()
+	listener, ok := m.listeners[id]
+	if ok {
+		delete(m.listeners, id)
+	}
+	m.mu.Unlock()
+	if ok {
+		m.observer.ListenerClosed(m.Config().Path, listener.transport, reason)
+	}
 }
 
 func (m *Mount) SubscribeEvents(afterID uint64) (<-chan Event, func()) {
@@ -479,18 +543,14 @@ func (m *Mount) startFallback(ctx context.Context, cfg config.Mount, desired str
 				defer close(out)
 				defer sub.Close("fallback_end")
 				for {
+					chunk, err := sub.Next(ctx)
+					if err != nil {
+						return
+					}
 					select {
+					case out <- chunk.Data:
 					case <-ctx.Done():
 						return
-					case chunk, ok := <-sub.C:
-						if !ok {
-							return
-						}
-						select {
-						case out <- chunk.Data:
-						case <-ctx.Done():
-							return
-						}
 					}
 				}
 			}()
@@ -564,43 +624,51 @@ func (m *Mount) setActive(active string) {
 }
 
 func (m *Mount) broadcast(data []byte, at time.Time) {
-	path := m.Config().Path
+	cfg, defaults := m.settings()
 	m.mu.Lock()
 	m.sequence++
 	chunk := Chunk{Sequence: m.sequence, Data: data, At: at}
-	for id, l := range m.listeners {
-		select {
-		case l.ch <- chunk:
-		default:
-			delete(m.listeners, id)
-			l.closed.Store(true)
-			close(l.ch)
-			m.observer.ListenerClosed(path, l.transport, "slow")
-		}
+	if len(m.ring) == 0 {
+		m.ringFirst = m.sequence
 	}
-	m.bytesOut += uint64(len(data) * len(m.listeners))
+	m.ring = append(m.ring, chunk)
+	m.ringBytes += len(data)
+	maxBytes := bufferBytes(cfg, defaults)
+	for m.ringBytes > maxBytes && len(m.ring) > 1 {
+		m.ringBytes -= len(m.ring[0].Data)
+		m.ring[0] = Chunk{}
+		m.ring = m.ring[1:]
+		m.ringFirst++
+	}
+	oldNotify := m.notify
+	m.notify = make(chan struct{})
+	close(oldNotify)
 	m.mu.Unlock()
 }
 
 func (m *Mount) closeListeners(reason string) {
 	path := m.Config().Path
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	transports := make([]string, 0, len(m.listeners))
 	for id, l := range m.listeners {
 		delete(m.listeners, id)
-		if !l.closed.Swap(true) {
-			close(l.ch)
-			m.observer.ListenerClosed(path, l.transport, reason)
-		}
+		transports = append(transports, l.transport)
 	}
 	for id, ch := range m.eventSubs {
 		delete(m.eventSubs, id)
 		close(ch)
 	}
+	oldNotify := m.notify
+	m.notify = make(chan struct{})
+	close(oldNotify)
+	m.mu.Unlock()
+	for _, transport := range transports {
+		m.observer.ListenerClosed(path, transport, reason)
+	}
 }
 
 func (m *Mount) Status() Status {
-	cfg := m.Config()
+	cfg, defaults := m.settings()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	listeners := 0
@@ -609,26 +677,20 @@ func (m *Mount) Status() Status {
 			listeners++
 		}
 	}
-	return Status{Path: cfg.Path, Profile: cfg.Profile, ContentType: cfg.ContentType, Source: m.source, Active: m.active, Listeners: listeners, Metadata: m.metadata, LastSource: m.lastSource, BytesIn: m.bytesIn, BytesOut: m.bytesOut}
+	return Status{Path: cfg.Path, Profile: cfg.Profile, ContentType: cfg.ContentType, Source: m.source, Active: m.active, Listeners: listeners, Metadata: m.metadata, LastSource: m.lastSource, BytesIn: m.bytesIn, BytesOut: m.bytesOut, BufferBytes: m.ringBytes, BufferLimit: bufferBytes(cfg, defaults), OldestSequence: m.ringFirst, LatestSequence: m.sequence}
 }
 
-func Copy(ctx context.Context, dst io.Writer, sub subscription, onWrite func(int)) error {
+func Copy(ctx context.Context, dst io.Writer, sub subscription) error {
 	defer sub.Close("client_closed")
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case chunk, ok := <-sub.C:
-			if !ok {
-				return ErrSlowListener
-			}
-			n, err := dst.Write(chunk.Data)
-			if n > 0 && onWrite != nil {
-				onWrite(n)
-			}
-			if err != nil {
-				return err
-			}
+		chunk, err := sub.Next(ctx)
+		if err != nil {
+			return err
+		}
+		n, err := dst.Write(chunk.Data)
+		sub.RecordWrite(n)
+		if err != nil {
+			return err
 		}
 	}
 }

@@ -7,9 +7,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 )
 
 const maxFrameSize = 1 << 20
+
+var errValidated = errors.New("media frame validated")
+
+func ValidateFile(profile, path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	err = Pump(profile, file, func([]byte) error { return errValidated })
+	if errors.Is(err, errValidated) {
+		return nil
+	}
+	return err
+}
 
 func Pump(profile string, r io.Reader, write func([]byte) error) error {
 	br := bufio.NewReaderSize(r, 64<<10)
@@ -151,7 +167,7 @@ func pumpOgg(r *bufio.Reader, write func([]byte) error) error {
 			size += int(v)
 		}
 		if size > maxFrameSize {
-			return errors.New("Ogg page too large")
+			return errors.New("ogg page too large")
 		}
 		page, err := readN(r, size)
 		if err != nil {

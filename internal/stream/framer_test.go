@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
 	"testing"
 )
 
@@ -19,6 +20,25 @@ func TestPumpMP3Frames(t *testing.T) {
 	}
 	if len(frames) != 2 || len(frames[0]) != 417 {
 		t.Fatalf("frames=%d size=%d", len(frames), len(frames[0]))
+	}
+}
+
+func TestValidateFile(t *testing.T) {
+	frame := make([]byte, 417)
+	copy(frame, []byte{0xff, 0xfb, 0x90, 0x64})
+	path := t.TempDir() + "/valid.mp3"
+	if err := os.WriteFile(path, frame, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateFile("mp3", path); err != nil {
+		t.Fatal(err)
+	}
+	bad := t.TempDir() + "/bad.mp3"
+	if err := os.WriteFile(bad, []byte("not audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateFile("mp3", bad); err == nil {
+		t.Fatal("invalid media accepted")
 	}
 }
 

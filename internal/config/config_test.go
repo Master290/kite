@@ -79,3 +79,24 @@ mounts:
 		t.Fatalf("source file=%q", cfg.Mounts[0].Source.PasswordFile)
 	}
 }
+
+func TestStaticKeyIncludesTLSAndServerSettings(t *testing.T) {
+	cfg := Default()
+	base := cfg.StaticKey()
+	cfg.Server.PublicHTTPSPort++
+	if cfg.StaticKey() == base {
+		t.Fatal("public port missing from static key")
+	}
+	cfg = Default()
+	base = cfg.StaticKey()
+	cfg.TLS.CertificateFile = "other.pem"
+	if cfg.StaticKey() == base {
+		t.Fatal("certificate path missing from static key")
+	}
+	cfg = Default()
+	base = cfg.StaticKey()
+	cfg.Server.IdleTimeout = Duration(time.Minute)
+	if cfg.StaticKey() == base {
+		t.Fatal("server timeout missing from static key")
+	}
+}

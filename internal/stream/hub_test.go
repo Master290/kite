@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"context"
 	"os"
 	"testing"
 	"time"
@@ -32,13 +33,14 @@ func TestHubBroadcastsCompleteChunk(t *testing.T) {
 	if err := m.Write(want); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case got := <-sub.C:
-		if string(got.Data) != string(want) {
-			t.Fatalf("got %q", got.Data)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := sub.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Data) != string(want) {
+		t.Fatalf("got %q", got.Data)
 	}
 }
 
@@ -59,20 +61,24 @@ func TestHubSwitchesToFallbackMount(t *testing.T) {
 	defer b.ReleaseSource()
 	sub := p.Subscribe("test")
 	defer sub.Close("done")
-	deadline := time.After(2 * time.Second)
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			_ = b.Write([]byte("backup-frame"))
-		case got := <-sub.C:
-			if string(got.Data) != "backup-frame" {
-				t.Fatalf("got %q", got.Data)
+	go func() {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			if b.Write([]byte("backup-frame")) != nil {
+				return
 			}
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for {
+		got, err := sub.Next(ctx)
+		if err != nil {
+			t.Fatalf("timed out; status=%+v err=%v", p.Status(), err)
+		}
+		if string(got.Data) == "backup-frame" {
 			return
-		case <-deadline:
-			t.Fatalf("timed out; status=%+v", p.Status())
 		}
 	}
 }
@@ -119,5 +125,59 @@ func TestHubPromotesLiveBackupOverFile(t *testing.T) {
 		case <-time.After(time.Until(deadline)):
 			t.Fatalf("backup was not promoted: %+v", p.Status())
 		}
+	}
+}
+
+func TestSharedRingRejectsSlowListener(t *testing.T) {
+	mCfg := testMount("/radio")
+	mCfg.Metadata.Bitrate = 8000
+	h, err := NewHub(testConfig(mCfg), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	m, _ := h.Get("/radio")
+	sub := m.Subscribe("test")
+	defer sub.Close("done")
+	if err := m.AcquireSource(); err != nil {
+		t.Fatal(err)
+	}
+	defer m.ReleaseSource()
+	payload := make([]byte, 10<<10)
+	for i := 0; i < 3; i++ {
+		if err := m.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.RLock()
+		first := m.ringFirst
+		m.mu.RUnlock()
+		if first > 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := sub.Next(ctx); err != ErrSlowListener {
+		t.Fatalf("error=%v status=%+v", err, m.Status())
+	}
+}
+
+func TestEventSubscriberReceivesInitialState(t *testing.T) {
+	h, err := NewHub(testConfig(testMount("/radio")), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	m, _ := h.Get("/radio")
+	events, cancel := m.SubscribeEvents(0)
+	defer cancel()
+	first := <-events
+	second := <-events
+	if first.Type != "source" || second.Type != "metadata" {
+		t.Fatalf("events=%s,%s", first.Type, second.Type)
 	}
 }

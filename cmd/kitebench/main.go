@@ -80,6 +80,9 @@ func run() error {
 				n, err := resp.Body.Read(buf)
 				bytesRead.Add(uint64(n))
 				if err != nil {
+					if ctx.Err() == nil {
+						failed.Add(1)
+					}
 					return
 				}
 			}
@@ -89,9 +92,14 @@ func run() error {
 	wg.Wait()
 	elapsed := time.Since(start)
 	mbps := float64(bytesRead.Load()*8) / elapsed.Seconds() / 1_000_000
-	fmt.Printf("listeners=%d connected=%d failed=%d bytes=%d elapsed=%s throughput=%.2fMbps\n", *listeners, connected.Load(), failed.Load(), bytesRead.Load(), elapsed.Round(time.Millisecond), mbps)
-	if failed.Load() > 0 {
-		return fmt.Errorf("%d listener(s) failed", failed.Load())
+	failures := failed.Load()
+	missing := uint64(*listeners) - connected.Load()
+	if missing > failures {
+		failures = missing
+	}
+	fmt.Printf("listeners=%d connected=%d failed=%d bytes=%d elapsed=%s throughput=%.2fMbps\n", *listeners, connected.Load(), failures, bytesRead.Load(), elapsed.Round(time.Millisecond), mbps)
+	if failures > 0 {
+		return fmt.Errorf("%d listener(s) failed", failures)
 	}
 	return nil
 }

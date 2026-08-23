@@ -50,6 +50,8 @@ fallback:
 
 Kite switches after `source_timeout` without valid input. It returns to a stable primary after `failback_delay`. Listener connections remain open. The switch occurs at a media frame/page boundary; Kite does not decode, crossfade, or normalize audio.
 
+Kite validates every configured fallback file during startup and before a dynamic configuration commit. A missing file or a file without a valid first frame/page rejects the complete configuration without changing disk or runtime state.
+
 File fallback is looped and paced using `metadata.bitrate`, or 128 kbit/s if it is omitted.
 
 ## Buffering
@@ -59,4 +61,3 @@ File fallback is looped and paced using `metadata.bitrate`, or 128 kbit/s if it 
 ## CORS
 
 List allowed browser origins per mount. `"*"` is suitable only for public streams. WebSocket requests are rejected when their `Origin` is not allowed.
-

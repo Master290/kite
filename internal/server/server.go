@@ -42,8 +42,11 @@ type Server struct {
 	challengeServer *http.Server
 	http3Server     *http3.Server
 	listeners       []net.Listener
+	packetConns     []net.PacketConn
 	wg              sync.WaitGroup
-	closed          atomic.Bool
+	ready           atomic.Bool
+	shutdownOnce    sync.Once
+	shutdownErr     error
 }
 
 func New(cfg *config.Config, configPath string, logger *slog.Logger) (*Server, error) {
@@ -53,6 +56,9 @@ func New(cfg *config.Config, configPath string, logger *slog.Logger) (*Server, e
 	metrics := NewMetrics()
 	store := NewConfigStore(configPath, cfg)
 	metrics.SetRevision(store.Revision())
+	if err := validateFallbackFiles(cfg); err != nil {
+		return nil, err
+	}
 	var tlsProvider *certificateProvider
 	var err error
 	if cfg.Server.HTTPSAddress != "" {
@@ -71,8 +77,15 @@ func New(cfg *config.Config, configPath string, logger *slog.Logger) (*Server, e
 
 func (s *Server) Config() *config.Config { return s.store.Current() }
 
-func (s *Server) Start(ctx context.Context) error {
+func (s *Server) Start(ctx context.Context) (startErr error) {
 	cfg := s.Config()
+	defer func() {
+		if startErr != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout.Duration())
+			defer cancel()
+			_ = s.Shutdown(cleanupCtx)
+		}
+	}()
 	publicMux := http.NewServeMux()
 	s.registerPublic(publicMux)
 	if cfg.Server.HTTPAddress != "" {
@@ -87,6 +100,7 @@ func (s *Server) Start(ctx context.Context) error {
 		go func() {
 			defer s.wg.Done()
 			if err := s.httpServer.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				s.ready.Store(false)
 				s.log.Error("http server stopped", "error", err)
 			}
 		}()
@@ -107,6 +121,7 @@ func (s *Server) Start(ctx context.Context) error {
 		go func() {
 			defer s.wg.Done()
 			if err := https.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				s.ready.Store(false)
 				s.log.Error("https server stopped", "error", err)
 			}
 		}()
@@ -116,22 +131,37 @@ func (s *Server) Start(ctx context.Context) error {
 			http.Redirect(w, r, "https://"+r.Host+r.URL.RequestURI(), http.StatusPermanentRedirect)
 		}))
 		s.challengeServer = &http.Server{Addr: cfg.TLS.HTTPChallengeAddress, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+		challengeListener, err := net.Listen("tcp", cfg.TLS.HTTPChallengeAddress)
+		if err != nil {
+			return err
+		}
+		s.listeners = append(s.listeners, challengeListener)
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			if err := s.challengeServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := s.challengeServer.Serve(challengeListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.log.Error("acme challenge server stopped", "error", err)
 			}
 		}()
 	}
 	if cfg.Server.HTTP3Address != "" {
+		udpAddress, err := net.ResolveUDPAddr("udp", cfg.Server.HTTP3Address)
+		if err != nil {
+			return err
+		}
+		packetConn, err := net.ListenUDP("udp", udpAddress)
+		if err != nil {
+			return err
+		}
+		s.packetConns = append(s.packetConns, packetConn)
 		h3Mux := http.NewServeMux()
 		s.registerPublic(h3Mux)
-		s.http3Server = &http3.Server{Addr: cfg.Server.HTTP3Address, Handler: h3Mux, TLSConfig: s.tls.TLSConfig()}
+		s.http3Server = &http3.Server{Handler: h3Mux, TLSConfig: s.tls.TLSConfig()}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			if err := s.http3Server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := s.http3Server.Serve(packetConn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				s.ready.Store(false)
 				s.log.Error("http3 server stopped", "error", err)
 			}
 		}()
@@ -148,46 +178,48 @@ func (s *Server) Start(ctx context.Context) error {
 	go func() {
 		defer s.wg.Done()
 		if err := s.adminServer.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.ready.Store(false)
 			s.log.Error("admin server stopped", "error", err)
 		}
 	}()
-	go func() { <-ctx.Done(); _ = s.Shutdown(context.Background()) }()
+	s.ready.Store(true)
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout.Duration())
+		defer cancel()
+		_ = s.Shutdown(shutdownCtx)
+	}()
 	return nil
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	if !s.closed.CompareAndSwap(false, true) {
-		return nil
-	}
-	s.hub.Close()
-	var errs []error
-	if s.httpServer != nil {
-		if err := s.httpServer.Shutdown(ctx); err != nil {
-			errs = append(errs, err)
+	s.shutdownOnce.Do(func() {
+		s.ready.Store(false)
+		s.hub.Close()
+		var errs []error
+		for _, httpServer := range []*http.Server{s.httpServer, s.httpsServer, s.adminServer, s.challengeServer} {
+			if httpServer == nil {
+				continue
+			}
+			if err := httpServer.Shutdown(ctx); err != nil {
+				errs = append(errs, err)
+				_ = httpServer.Close()
+			}
 		}
-	}
-	if s.httpsServer != nil {
-		if err := s.httpsServer.Shutdown(ctx); err != nil {
-			errs = append(errs, err)
+		if s.http3Server != nil {
+			if err := s.http3Server.Close(); err != nil {
+				errs = append(errs, err)
+			}
 		}
-	}
-	if s.adminServer != nil {
-		if err := s.adminServer.Shutdown(ctx); err != nil {
-			errs = append(errs, err)
+		for _, packetConn := range s.packetConns {
+			if err := packetConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				errs = append(errs, err)
+			}
 		}
-	}
-	if s.challengeServer != nil {
-		if err := s.challengeServer.Shutdown(ctx); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if s.http3Server != nil {
-		if err := s.http3Server.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	s.wg.Wait()
-	return errors.Join(errs...)
+		s.wg.Wait()
+		s.shutdownErr = errors.Join(errs...)
+	})
+	return s.shutdownErr
 }
 
 func (s *Server) registerPublic(mux *http.ServeMux) {
@@ -209,6 +241,14 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !s.ready.Load() {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready\n"))
 	})
 }
 
@@ -239,12 +279,18 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("icy-url", m.Config().Metadata.URL)
 	w.Header().Set("icy-br", strconv.Itoa(m.Config().Metadata.Bitrate))
 	w.Header().Set("Access-Control-Expose-Headers", "icy-name, icy-description, icy-genre, icy-url, icy-br")
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	if r.Header.Get("Icy-MetaData") == "1" {
 		s.streamICY(w, r, m)
 		return
 	}
 	sub := m.Subscribe("http")
-	stream.Copy(r.Context(), w, sub, func(n int) { s.metrics.BytesOut(m.Config().Path, "http", n) })
+	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration())
+	defer writer.Flush()
+	_ = stream.Copy(r.Context(), writer, sub)
 }
 
 func (s *Server) handleSource(w http.ResponseWriter, r *http.Request, m *stream.Mount) {
@@ -272,7 +318,7 @@ func (s *Server) handleSource(w http.ResponseWriter, r *http.Request, m *stream.
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	if err != nil && !errors.Is(err, context.Canceled) {
+	if !errors.Is(err, context.Canceled) {
 		s.log.Warn("source stream ended", "mount", m.Config().Path, "error", err)
 		http.Error(w, "invalid source stream", http.StatusBadRequest)
 	}
@@ -298,7 +344,7 @@ func (s *Server) handleRawSource(w http.ResponseWriter, r *http.Request, m *stre
 		return
 	}
 	err = stream.Pump(m.Config().Profile, rw.Reader, m.Write)
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, net.ErrClosed) {
+	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, net.ErrClosed) {
 		s.log.Warn("raw source stream ended", "mount", m.Config().Path, "error", err)
 	} else {
 		s.log.Info("source disconnected", "mount", m.Config().Path, "reason", err)
@@ -308,34 +354,42 @@ func (s *Server) handleRawSource(w http.ResponseWriter, r *http.Request, m *stre
 func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mount) {
 	metaInt := m.Config().ICYMetaInterval
 	w.Header().Set("icy-metaint", strconv.Itoa(metaInt))
-	w.Header().Set("Transfer-Encoding", "chunked")
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
 	sub := m.Subscribe("http-icy")
 	defer sub.Close("client_closed")
+	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration())
+	defer writer.Flush()
 	meta := ""
 	sent := 0
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case chunk, ok := <-sub.C:
-			if !ok {
+		default:
+			chunk, err := sub.Next(r.Context())
+			if err != nil {
 				return
 			}
 			data := chunk.Data
 			for len(data) > 0 {
 				need := metaInt - sent
 				if len(data) < need {
-					_, _ = w.Write(data)
-					s.metrics.BytesOut(m.Config().Path, "http-icy", len(data))
+					n, err := writer.Write(data)
+					sub.RecordWrite(n)
+					if err != nil {
+						return
+					}
 					sent += len(data)
 					data = nil
 					continue
 				}
-				_, _ = w.Write(data[:need])
-				s.metrics.BytesOut(m.Config().Path, "http-icy", need)
+				n, err := writer.Write(data[:need])
+				sub.RecordWrite(n)
+				if err != nil {
+					return
+				}
 				data = data[need:]
 				sent = 0
 				meta = "StreamTitle='" + strings.ReplaceAll(m.Metadata().Title, "'", "\\'") + "';"
@@ -345,10 +399,10 @@ func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mou
 				block := []byte{byte((len(meta) + 16 - 1) / 16)}
 				padded := append([]byte(meta), make([]byte, int(block[0])*16-len(meta))...)
 				block = append(block, padded...)
-				_, _ = w.Write(block)
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
+				if _, err := writer.Write(block); err != nil {
+					return
 				}
+				writer.Flush()
 			}
 		}
 	}
@@ -411,10 +465,29 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer c.Close(websocket.StatusNormalClosure, "")
 	ctx := r.Context()
 	sub := m.Subscribe("websocket")
+	defer sub.Close("client_closed")
 	events, cancel := m.SubscribeEvents(0)
 	defer cancel()
 	hello, _ := json.Marshal(map[string]any{"type": "hello", "mount": m.Config().Path, "profile": m.Config().Profile, "content_type": m.Config().ContentType})
 	_ = c.Write(ctx, websocket.MessageText, hello)
+	type audioResult struct {
+		chunk stream.Chunk
+		err   error
+	}
+	audio := make(chan audioResult, 1)
+	go func() {
+		for {
+			chunk, err := sub.Next(ctx)
+			select {
+			case audio <- audioResult{chunk: chunk, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -427,14 +500,17 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if err := c.Write(ctx, websocket.MessageText, b); err != nil {
 				return
 			}
-		case chunk, ok := <-sub.C:
-			if !ok {
+		case result := <-audio:
+			if result.err != nil {
+				if errors.Is(result.err, stream.ErrSlowListener) {
+					_ = c.Close(websocket.StatusTryAgainLater, "listener fell behind")
+				}
 				return
 			}
-			if err := c.Write(ctx, websocket.MessageBinary, chunk.Data); err != nil {
+			if err := c.Write(ctx, websocket.MessageBinary, result.chunk.Data); err != nil {
 				return
 			}
-			s.metrics.BytesOut(m.Config().Path, "websocket", len(chunk.Data))
+			sub.RecordWrite(len(result.chunk.Data))
 		}
 	}
 }
@@ -449,7 +525,11 @@ func (s *Server) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "audio/x-mpegurl")
-	fmt.Fprintf(w, "#EXTM3U\n#EXTINF:-1,Kite\n%s\n", mount)
+	base := "https://" + r.Host
+	if r.TLS == nil {
+		base = "http://" + r.Host
+	}
+	fmt.Fprintf(w, "#EXTM3U\n#EXTINF:-1,Kite\n%s%s\n", base, mount)
 }
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	items := make([]stream.Status, 0)
@@ -472,7 +552,7 @@ func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.checkSourceAuth(r, m.Config().Source) {
-		http.Error(w, "unauthorized", 401)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	title := r.FormValue("song")
@@ -490,11 +570,11 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodPut {
-		http.Error(w, "method not allowed", 405)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if match := r.Header.Get("If-Match"); match != "" && match != s.store.ETag() {
-		http.Error(w, "etag mismatch", 412)
+		http.Error(w, "etag mismatch", http.StatusPreconditionFailed)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
@@ -508,9 +588,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.restoreRedactedSecrets(next)
-	rev, err := s.store.Commit(next, s.applyConfig)
+	rev, err := s.store.Commit(next, validateFallbackFiles, s.applyConfig)
 	if errors.Is(err, ErrRestartRequired) {
-		http.Error(w, err.Error(), 409)
+		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 	if err != nil {
@@ -540,9 +620,9 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	rev, err := s.store.Commit(next, s.applyConfig)
+	rev, err := s.store.Commit(next, validateFallbackFiles, s.applyConfig)
 	if errors.Is(err, ErrRestartRequired) {
-		http.Error(w, err.Error(), 409)
+		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
 	if err != nil {
@@ -571,7 +651,21 @@ func (s *Server) handleSourceAction(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
-func (s *Server) applyConfig(next *config.Config) error { return s.hub.Apply(next) }
+func (s *Server) applyConfig(next *config.Config) { _ = s.hub.Apply(next) }
+
+func validateFallbackFiles(cfg *config.Config) error {
+	for _, mount := range cfg.Mounts {
+		for _, fallback := range mount.Fallback {
+			if fallback.File == "" {
+				continue
+			}
+			if err := stream.ValidateFile(mount.Profile, fallback.File); err != nil {
+				return fmt.Errorf("mount %s fallback file %s: %w", mount.Path, fallback.File, err)
+			}
+		}
+	}
+	return nil
+}
 
 func (s *Server) restoreRedactedSecrets(next *config.Config) {
 	current := s.Config()
@@ -613,12 +707,12 @@ func (s *Server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := s.adminToken()
 		if token == "" {
-			http.Error(w, "admin token is not configured", 503)
+			http.Error(w, "admin token is not configured", http.StatusServiceUnavailable)
 			return
 		}
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
-			http.Error(w, "unauthorized", 401)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		next(w, r)
@@ -645,12 +739,21 @@ func (s *Server) checkSourceAuth(r *http.Request, cred config.SourceCredential) 
 	}
 	expected := cred.PasswordBcrypt
 	if cred.PasswordEnv != "" {
-		b, _ := config.ResolveSecret(cred.PasswordEnv, "")
+		b, err := config.ResolveSecret(cred.PasswordEnv, "")
+		if err != nil {
+			return false
+		}
 		expected = string(b)
 	}
 	if cred.PasswordFile != "" {
-		b, _ := config.ResolveSecret("", cred.PasswordFile)
+		b, err := config.ResolveSecret("", cred.PasswordFile)
+		if err != nil {
+			return false
+		}
 		expected = string(b)
+	}
+	if expected == "" {
+		return false
 	}
 	if strings.HasPrefix(expected, "$2") {
 		return bcrypt.CompareHashAndPassword([]byte(expected), []byte(pass)) == nil
@@ -687,6 +790,32 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+type intervalWriter struct {
+	writer   io.Writer
+	flusher  http.Flusher
+	interval time.Duration
+	last     time.Time
+}
+
+func newIntervalWriter(w http.ResponseWriter, interval time.Duration) *intervalWriter {
+	flusher, _ := w.(http.Flusher)
+	return &intervalWriter{writer: w, flusher: flusher, interval: interval, last: time.Now()}
+}
+func (w *intervalWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	if w.flusher != nil && (w.interval <= 0 || time.Since(w.last) >= w.interval) {
+		w.flusher.Flush()
+		w.last = time.Now()
+	}
+	return n, err
+}
+func (w *intervalWriter) Flush() {
+	if w.flusher != nil {
+		w.flusher.Flush()
+		w.last = time.Now()
+	}
 }
 
 func BasicAuthHeader(user, password string) string {
