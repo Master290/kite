@@ -25,6 +25,7 @@ type certificateProvider struct {
 	mode     string
 	cert     *tls.Certificate
 	certMod  time.Time
+	keyMod   time.Time
 	certFile string
 	keyFile  string
 	manager  *autocert.Manager
@@ -62,7 +63,15 @@ func (p *certificateProvider) TLSConfig() *tls.Config {
 	if p.manager != nil {
 		base := p.manager.TLSConfig()
 		base.MinVersion = tls.VersionTLS12
-		base.NextProtos = c.NextProtos
+		base.NextProtos = mergeProtocols(c.NextProtos, base.NextProtos)
+		getCertificate := base.GetCertificate
+		base.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			cert, err := getCertificate(hello)
+			if err == nil {
+				p.recordExpiry(cert)
+			}
+			return cert, err
+		}
 		return base
 	}
 	c.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -77,20 +86,42 @@ func (p *certificateProvider) TLSConfig() *tls.Config {
 func (p *certificateProvider) loadFiles() (*tls.Certificate, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	info, err := os.Stat(p.certFile)
+	certInfo, err := os.Stat(p.certFile)
 	if err != nil {
 		return nil, err
 	}
-	if p.cert != nil && !info.ModTime().After(p.certMod) {
+	keyInfo, err := os.Stat(p.keyFile)
+	if err != nil {
+		return nil, err
+	}
+	if p.cert != nil && !certInfo.ModTime().After(p.certMod) && !keyInfo.ModTime().After(p.keyMod) {
 		return p.cert, nil
 	}
 	cert, err := tls.LoadX509KeyPair(p.certFile, p.keyFile)
 	if err != nil {
 		return nil, err
 	}
-	p.cert, p.certMod = &cert, info.ModTime()
+	p.cert, p.certMod, p.keyMod = &cert, certInfo.ModTime(), keyInfo.ModTime()
 	p.recordExpiry(&cert)
 	return &cert, nil
+}
+
+func mergeProtocols(preferred, existing []string) []string {
+	merged := make([]string, 0, len(preferred)+len(existing))
+	seen := make(map[string]struct{}, cap(merged))
+	for _, protocols := range [][]string{preferred, existing} {
+		for _, protocol := range protocols {
+			if protocol == "" {
+				continue
+			}
+			if _, ok := seen[protocol]; ok {
+				continue
+			}
+			seen[protocol] = struct{}{}
+			merged = append(merged, protocol)
+		}
+	}
+	return merged
 }
 
 func (p *certificateProvider) recordExpiry(cert *tls.Certificate) {

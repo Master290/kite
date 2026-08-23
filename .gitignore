@@ -13,5 +13,6 @@ node_modules/
 *.pem
 *.key
 .env
+/kite.production.yaml
 /testdata/e2e.*
 /testdata/*-e2e.*

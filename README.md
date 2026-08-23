@@ -48,6 +48,10 @@ ffmpeg -re -i input.wav -codec:a libmp3lame -b:a 128k -content_type audio/mpeg \
 
 For the self-signed development certificate, use a source client option that disables certificate verification. For production, use ACME or configured certificate files.
 
+Production deployment templates are provided in [`kite.production.example.yaml`](kite.production.example.yaml), [`.env.example`](.env.example), and [`compose.production.yaml`](compose.production.yaml). Copy the first two files to `kite.production.yaml` and `.env`, replace the example hostname, email, and secrets, then run `docker compose -f compose.production.yaml up -d --build`. DNS for the ACME hostname must already point to the host, and TCP port 80 plus TCP/UDP port 443 must be reachable from the Internet. The Compose file exposes the admin API only at `127.0.0.1:9090` on the host.
+
+See the [production deployment guide](docs/deployment.md) for DNS, firewall, verification, BUTT, update, and backup instructions.
+
 Listen with curl:
 
 ```bash

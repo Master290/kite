@@ -16,6 +16,8 @@ Changing any listener address at runtime requires a restart.
 
 An alternative ACME directory can be configured with `acme_directory_url`, which is useful for Pebble testing.
 
+For a public ACME deployment, point every hostname in `tls.hosts` at the server, allow inbound TCP `80` and TCP/UDP `443`, and keep `tls.cache_directory` on persistent storage. The HTTP challenge listener owns its configured internal port while ACME is active; do not also configure `server.http_address` on that port. The production Compose example maps host ports 80/443 to unprivileged container ports and publishes the admin API only on host loopback (`127.0.0.1:9090`).
+
 ## Source credentials
 
 Each mount requires exactly one credential source:

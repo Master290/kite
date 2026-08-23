@@ -12,6 +12,6 @@ RUN apk add --no-cache ca-certificates && addgroup -S kite && adduser -S -G kite
 COPY --from=build /out/kite /usr/local/bin/kite
 USER kite
 WORKDIR /var/lib/kite
-EXPOSE 8000/tcp 8443/tcp 8443/udp 9090/tcp
+EXPOSE 8000/tcp 8080/tcp 8443/tcp 8443/udp 9090/tcp
 ENTRYPOINT ["kite"]
 CMD ["serve", "-config", "/var/lib/kite/kite.yaml"]
