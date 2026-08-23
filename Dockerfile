@@ -8,7 +8,7 @@ ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/kite ./cmd/kite
 
 FROM alpine:3.23
-RUN apk add --no-cache ca-certificates && addgroup -S kite && adduser -S -G kite kite
+RUN apk add --no-cache ca-certificates wget && addgroup -S kite && adduser -S -G kite kite
 COPY --from=build /out/kite /usr/local/bin/kite
 USER kite
 WORKDIR /var/lib/kite
