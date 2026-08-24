@@ -2,6 +2,8 @@
 
 Kite is a lightweight Icecast-compatible streaming server written in Go. It accepts live audio from existing Icecast source clients and serves the same stream over HTTP/1.1, HTTP/2, HTTP/3, WebSocket, and SSE without transcoding.
 
+Read the documentation at https://master290.github.io/kite/.
+
 The project is an early implementation. Its current focus is a dependable single-node data plane: bounded latency, bounded memory, hot source fallback, dynamic configuration, native TLS, and observability.
 
 ## Features
@@ -130,6 +132,10 @@ cd sdk
 npm ci
 npm test
 npm run build
+
+cd ..
+python -m pip install -r requirements-docs.txt
+python -m mkdocs serve
 ```
 
 Linux CI also runs the race detector. See [architecture](docs/architecture.md) for the data flow and safety model.

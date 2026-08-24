@@ -42,7 +42,7 @@ curl -H "Authorization: Bearer $KITE_ADMIN_TOKEN" \
 
 Prometheus can scrape `http://127.0.0.1:9090/metrics` locally. If Prometheus runs in another container, attach both services to a private Docker network rather than publishing the admin listener publicly.
 
-Ready-to-load alert rules are in [`deploy/prometheus/kite-alerts.yml`](../deploy/prometheus/kite-alerts.yml). Change the `job="kite"` selector in `KiteNotReady` if your Prometheus scrape job uses another name. The source-disconnected alert is intentionally a warning because a configured fallback may keep listeners online.
+Ready-to-load alert rules are in [`deploy/prometheus/kite-alerts.yml`](https://github.com/Master290/kite/blob/main/deploy/prometheus/kite-alerts.yml). Change the `job="kite"` selector in `KiteNotReady` if your Prometheus scrape job uses another name. The source-disconnected alert is intentionally a warning because a configured fallback may keep listeners online.
 
 ## BUTT
 
