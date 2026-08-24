@@ -42,6 +42,8 @@ curl -H "Authorization: Bearer $KITE_ADMIN_TOKEN" \
 
 Prometheus can scrape `http://127.0.0.1:9090/metrics` locally. If Prometheus runs in another container, attach both services to a private Docker network rather than publishing the admin listener publicly.
 
+Ready-to-load alert rules are in [`deploy/prometheus/kite-alerts.yml`](../deploy/prometheus/kite-alerts.yml). Change the `job="kite"` selector in `KiteNotReady` if your Prometheus scrape job uses another name. The source-disconnected alert is intentionally a warning because a configured fallback may keep listeners online.
+
 ## BUTT
 
 Configure an IceCast server with:
@@ -61,8 +63,17 @@ Listeners use `https://radio.example.com/radio`. UDP 443 enables HTTP/3 where th
 ```bash
 docker compose -f compose.production.yaml build --pull
 docker compose -f compose.production.yaml up -d
-docker run --rm -v kite_kite-data:/data -v "$PWD":/backup alpine \
-  tar czf /backup/kite-data.tar.gz -C /data .
+./scripts/backup-kite-data.sh backups/kite-data-$(date -u +%Y%m%dT%H%M%SZ).tar.gz
 ```
 
 The backup contains ACME account and certificate material and must be protected like any other credential.
+
+To restore, stop the service first and use the explicit confirmation prompt:
+
+```bash
+docker compose -f compose.production.yaml down
+./scripts/restore-kite-data.sh backups/kite-data-20260824T120000Z.tar.gz
+docker compose -f compose.production.yaml up -d
+```
+
+Set `KITE_DATA_VOLUME` when the Compose project name is not the default, for example `KITE_DATA_VOLUME=myproject_kite-data`.

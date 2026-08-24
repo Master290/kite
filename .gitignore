@@ -14,5 +14,6 @@ node_modules/
 *.key
 .env
 /kite.production.yaml
+/backups/
 /testdata/e2e.*
 /testdata/*-e2e.*

@@ -1,0 +1,48 @@
+groups:
+  - name: kite
+    rules:
+      - alert: KiteNotReady
+        expr: up{job="kite"} == 1 and absent_over_time(kite_source_connected[5m])
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Kite metrics are reachable but no mount metrics are present
+          description: Prometheus can scrape Kite, but the server has not exposed source state for five minutes.
+
+      - alert: KiteSourceDisconnected
+        expr: kite_source_connected == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Kite source is disconnected on {{ $labels.mount }}
+          description: No primary source is connected to mount {{ $labels.mount }}; verify BUTT or the configured fallback.
+
+      - alert: KiteNoListenersAndNoSource
+        expr: sum by (mount) (kite_listeners) == 0 and kite_source_connected == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Kite mount {{ $labels.mount }} has no source or listeners
+          description: The mount has been idle for ten minutes. This may be expected for a private or scheduled station.
+
+      - alert: KiteCertificateExpiresSoon
+        expr: kite_tls_certificate_expiry_timestamp_seconds > 0 and kite_tls_certificate_expiry_timestamp_seconds - time() < 14 * 24 * 60 * 60
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: Kite TLS certificate expires soon
+          description: The active certificate expires in less than fourteen days; verify ACME cache persistence and outbound access.
+
+      - alert: KiteFallbackActive
+        expr: rate(kite_fallback_switches_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Kite has switched to fallback on {{ $labels.mount }}
+          description: Mount {{ $labels.mount }} switched fallback target {{ $labels.target }} recently; inspect source health.
+

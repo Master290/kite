@@ -52,6 +52,8 @@ Production deployment templates are provided in [`kite.production.example.yaml`]
 
 See the [production deployment guide](docs/deployment.md) for DNS, firewall, verification, BUTT, update, and backup instructions.
 
+Prometheus alert rules and portable Docker volume backup/restore helpers are included under [`deploy/prometheus`](deploy/prometheus) and [`scripts`](scripts).
+
 Listen with curl:
 
 ```bash
