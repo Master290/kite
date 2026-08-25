@@ -1,6 +1,7 @@
 /kite
 /kite.exe
 *.exe~
+/kite.yaml
 /dist/
 /coverage.out
 node_modules/
@@ -8,6 +9,7 @@ node_modules/
 /web/dist/
 /.idea/
 /.vscode/
+/.opencode/
 *.log
 *.err
 *.pem
