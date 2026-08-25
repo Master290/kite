@@ -20,3 +20,4 @@ node_modules/
 /site/
 /testdata/e2e.*
 /testdata/*-e2e.*
+/.prod-local/

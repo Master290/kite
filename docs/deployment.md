@@ -77,3 +77,5 @@ docker compose -f compose.production.yaml up -d
 ```
 
 Set `KITE_DATA_VOLUME` when the Compose project name is not the default, for example `KITE_DATA_VOLUME=myproject_kite-data`.
+
+Both scripts stream the archive through Docker stdin/stdout instead of bind mounts, so they behave the same on Linux, macOS, and Git Bash on Windows. When running them from Git Bash, set `MSYS_NO_PATHCONV=1` so MSYS does not rewrite container paths such as `/data`.

@@ -23,11 +23,10 @@ printf 'Continue? [y/N] '
 read answer
 [ "$answer" = "y" ] || [ "$answer" = "Y" ] || exit 1
 
-docker run --rm \
-  -v "${volume}:/data" \
-  -v "$(cd "$(dirname "$backup")" && pwd):/backup:ro" \
-  alpine:3.23 \
-  sh -c 'find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && tar xzf "/backup/$(basename "$1")" -C /data' \
-  sh "$(basename "$backup")"
+# Stream the archive through stdin and wipe the volume in one container,
+# avoiding host bind mounts so the script behaves the same everywhere.
+docker run --rm -i -v "${volume}:/data" alpine:3.23 sh -c '
+  find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+  tar xzf - -C /data
+' < "$backup"
 echo "Restored $backup into $volume"
-
