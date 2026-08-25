@@ -10,6 +10,25 @@ The simplest browser integration points an `<audio>` element at the mount:
 
 Browser codec support depends on the configured profile. Kite does not transcode audio.
 
+## HLS
+
+For maximum reach — iOS Safari, unstable mobile networks, CDN caching — point an HLS player at the live playlist:
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+<audio id="audio" controls></audio>
+<script>
+  const audio = document.querySelector("#audio");
+  if (audio.canPlayType("application/vnd.apple.mpegurl")) {
+    audio.src = "https://radio.example.com/radio.m3u8";
+  } else if (window.Hls) {
+    new Hls().loadSource("https://radio.example.com/radio.m3u8").attachMedia(audio);
+  }
+</script>
+```
+
+HLS is available for `mp3` and `aac-adts` mounts without transcoding. The window keeps six ~4-second MPEG-TS segments, so end-to-end latency is roughly 10–15 seconds versus under a second for the native `<audio>` path. Source switches appear as `#EXT-X-DISCONTINUITY`.
+
 ## SSE
 
 SSE carries metadata and source state without carrying audio bytes:

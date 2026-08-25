@@ -97,37 +97,8 @@ func pumpMP3(r *bufio.Reader, write func([]byte) error) error {
 }
 
 func mp3FrameLength(h []byte) (int, error) {
-	versionBits := (h[1] >> 3) & 3
-	layerBits := (h[1] >> 1) & 3
-	if versionBits == 1 || layerBits != 1 {
-		return 0, errors.New("unsupported MPEG header")
-	}
-	bitrateIndex := (h[2] >> 4) & 0xf
-	sampleIndex := (h[2] >> 2) & 3
-	padding := int((h[2] >> 1) & 1)
-	if bitrateIndex == 0 || bitrateIndex == 15 || sampleIndex == 3 {
-		return 0, errors.New("invalid MPEG rate")
-	}
-	mpeg1 := []int{0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0}
-	mpeg2 := []int{0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}
-	samples := []int{44100, 48000, 32000}
-	sampleRate := samples[sampleIndex]
-	bitrate := mpeg1[bitrateIndex]
-	coefficient := 144
-	if versionBits != 3 {
-		bitrate = mpeg2[bitrateIndex]
-		coefficient = 72
-		if versionBits == 2 {
-			sampleRate /= 2
-		} else {
-			sampleRate /= 4
-		}
-	}
-	length := coefficient*bitrate*1000/sampleRate + padding
-	if length < 4 || length > maxFrameSize {
-		return 0, errors.New("invalid MPEG frame length")
-	}
-	return length, nil
+	length, _, _, err := mp3FrameInfo(h)
+	return length, err
 }
 
 func pumpADTS(r *bufio.Reader, write func([]byte) error) error {

@@ -11,6 +11,7 @@ The project is an early implementation. Its current focus is a dependable single
 - Icecast source ingest through HTTP `PUT`, `POST`, and legacy `SOURCE ... ICE/1.0`.
 - Passthrough MP3, AAC/ADTS, and Ogg/Opus with frame/page-aware fan-out.
 - HTTP/1.1, HTTP/2, and HTTP/3 listener delivery with `Alt-Svc` discovery.
+- Live HLS output for MP3 and AAC mounts: sliding-window `.m3u8` plus MPEG-TS segments, no transcoding.
 - ICY response headers and interleaved `StreamTitle` metadata.
 - SSE metadata/source events with `Last-Event-ID` replay.
 - Binary audio plus JSON control events over WebSocket.

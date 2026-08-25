@@ -273,6 +273,9 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if s.routeHLS(w, r, r.URL.Path) {
+		return
+	}
 	m, ok := s.hub.Get(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)

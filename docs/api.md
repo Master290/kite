@@ -13,8 +13,14 @@
 | `GET /_kite/v1/playlist.m3u?mount=/radio` | Absolute M3U playlist |
 | `GET /status-json.xsl` | Mount status JSON |
 | `GET /demo` | Built-in player page (disable with `server.demo_enabled: false`) |
+| `GET /radio.m3u8` | Live HLS playlist for MP3 and AAC mounts |
+| `GET /radio.hls/<seq>.ts` | Immutable HLS MPEG-TS segment |
 | `GET /healthz` | Process health on the admin listener |
 | `GET /readyz` | Listener readiness on the admin listener |
+
+## HLS
+
+Mounts with the `mp3` or `aac-adts` profile are packaged into live HLS streams without transcoding: `/radio.m3u8` serves a sliding-window playlist (six ~4-second MPEG-TS segments) and each segment is served from `<mount>.hls/<sequence>.ts`. Segments are immutable and cacheable; playlists are not. Packaging starts on the first playlist request and stops after 30 seconds without listeners. Source switches and dropped data are marked with `#EXT-X-DISCONTINUITY`. Disable with `server.hls_enabled: false`.
 
 ## Source ingest
 

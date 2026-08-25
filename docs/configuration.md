@@ -8,6 +8,8 @@ Kite uses strict, versioned YAML. Unknown fields and invalid fallback graphs pre
 
 `server.demo_enabled` controls the built-in player page at `/demo`. It is enabled by default and can be toggled live through the admin config API; set it to `false` to stop serving the page without a restart.
 
+`server.hls_enabled` controls live HLS output (`.m3u8` playlists and MPEG-TS segments) for mounts with the `mp3` or `aac-adts` profile. It is enabled by default and can be toggled live.
+
 Changing any listener address at runtime requires a restart.
 
 ## TLS

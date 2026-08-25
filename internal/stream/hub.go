@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Master290/kite/internal/config"
@@ -221,6 +222,9 @@ type Mount struct {
 
 	sourceGuard  chan struct{}
 	sourceCloser io.Closer
+
+	hls   atomic.Pointer[hlsPackager]
+	hlsMu sync.Mutex
 }
 
 type Status struct {
