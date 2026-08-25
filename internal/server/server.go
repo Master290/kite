@@ -311,6 +311,7 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSource(w http.ResponseWriter, r *http.Request, m *stream.Mount) {
 	if !s.checkSourceAuth(r, m.Config().Source) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="kite"`)
 		http.Error(w, "source authentication failed", http.StatusUnauthorized)
 		return
 	}
@@ -582,6 +583,7 @@ func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.checkSourceAuth(r, m.Config().Source) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="kite"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

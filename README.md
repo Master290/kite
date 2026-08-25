@@ -46,8 +46,10 @@ Send an MP3 stream with FFmpeg:
 
 ```bash
 ffmpeg -re -i input.wav -codec:a libmp3lame -b:a 128k -content_type audio/mpeg \
-  -tls 1 -tls_verify 0 -f mp3 icecast://source:change-me@localhost:8443/radio
+  -tls_verify 0 -f mp3 https://source:change-me@localhost:8443/radio
 ```
+
+FFmpeg's `icecast://` scheme does not negotiate TLS on current releases; use the generic `https://` output shown above. Encoders without TLS support can enable `server.http_address: ":8000"` in `kite.yaml` and send plaintext to that port instead.
 
 For the self-signed development certificate, use a source client option that disables certificate verification. For production, use ACME or configured certificate files.
 

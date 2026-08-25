@@ -432,6 +432,25 @@ func TestAdminMetadataRequiresAuthAndUpdatesMount(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
+	if got := resp.Header.Get("WWW-Authenticate"); !strings.HasPrefix(got, `Basic realm=`) {
+		t.Fatalf("www-authenticate=%q", got)
+	}
+
+	sourceReq, err := http.NewRequest(http.MethodPut, ts.URL+"/radio", strings.NewReader("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceResp, err := http.DefaultClient.Do(sourceReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceResp.Body.Close()
+	if sourceResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("source status=%d", sourceResp.StatusCode)
+	}
+	if got := sourceResp.Header.Get("WWW-Authenticate"); !strings.HasPrefix(got, `Basic realm=`) {
+		t.Fatalf("source www-authenticate=%q", got)
+	}
 
 	req, err := http.NewRequest(http.MethodGet, ts.URL+"/admin/metadata?mount=/missing&song=X", nil)
 	if err != nil {
