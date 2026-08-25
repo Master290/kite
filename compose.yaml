@@ -4,6 +4,7 @@ services:
     ports:
       - "8443:8443/tcp"
       - "8443:8443/udp"
+      - "127.0.0.1:9090:9090/tcp"
     environment:
       KITE_SOURCE_PASSWORD: change-me
       KITE_ADMIN_TOKEN: change-admin-token

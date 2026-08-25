@@ -42,7 +42,6 @@ type hlsPackager struct {
 	segments  []hlsSegment // oldest first, bounded by hlsWindowSegments
 	nextSeq   uint64
 	cur       []byte   // in-flight segment bytes
-	curPts    uint64   // PTS of the first frame in cur
 	samples   uint64   // accumulated samples inside cur
 	rate      int      // sample rate of frames inside cur
 	pts       uint64   // running timeline for the next frame
@@ -187,7 +186,6 @@ func (p *hlsPackager) consume(chunk Chunk) {
 		}
 		if len(p.cur) == 0 {
 			p.cur = p.muxer.StartSegment(nil)
-			p.curPts = p.pts
 			p.samples = 0
 		}
 		if p.batchLen == 0 {

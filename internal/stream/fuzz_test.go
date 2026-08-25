@@ -84,3 +84,33 @@ func FuzzPumpOpaque(f *testing.F) {
 		}
 	})
 }
+
+// FuzzAnalyze covers the HLS frame analyzer, which parses the same untrusted
+// encoder bytes as the passthrough pumps. The first byte selects the profile
+// so a single target exercises both MP3 and ADTS parsing.
+func FuzzAnalyze(f *testing.F) {
+	frame := make([]byte, 417)
+	copy(frame, []byte{0xff, 0xfb, 0x90, 0x64})
+	adts := []byte{0xff, 0xf1, 0x50, 0x80, 0x02, 0x80, 0xfc}
+	f.Add(byte(0), append([]byte{0xff, 0xfb, 0x90, 0x64}, frame...))
+	f.Add(byte(0), []byte("ID3\x04\x00\x00\x00\x00\x00\x00"))
+	f.Add(byte(1), adts)
+	f.Add(byte(1), append(adts, adts...))
+	f.Add(byte(0), []byte{0xff, 0xe0})
+	f.Add(byte(1), []byte{})
+	f.Fuzz(func(t *testing.T, profileByte byte, data []byte) {
+		profile := "mp3"
+		if profileByte%2 == 1 {
+			profile = "aac-adts"
+		}
+		consumed, _ := AnalyzeBuffer(profile, data, func(f Frame) error {
+			if f.Samples <= 0 || f.SampleRate <= 0 {
+				t.Fatalf("bad timing samples=%d rate=%d", f.Samples, f.SampleRate)
+			}
+			return nil
+		})
+		if consumed < 0 || consumed > len(data) {
+			t.Fatalf("%s: consumed=%d len=%d", profile, consumed, len(data))
+		}
+	})
+}

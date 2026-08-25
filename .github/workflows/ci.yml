@@ -34,6 +34,7 @@ jobs:
       - run: go test ./internal/stream/ -run '^$' -fuzz FuzzPumpADTS -fuzztime 60s
       - run: go test ./internal/stream/ -run '^$' -fuzz FuzzPumpOgg -fuzztime 60s
       - run: go test ./internal/stream/ -run '^$' -fuzz FuzzPumpOpaque -fuzztime 30s
+      - run: go test ./internal/stream/ -run '^$' -fuzz FuzzAnalyze -fuzztime 60s
 
   sdk:
     runs-on: ubuntu-latest

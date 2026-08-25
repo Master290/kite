@@ -6,8 +6,6 @@ Kite uses strict, versioned YAML. Unknown fields and invalid fallback graphs pre
 
 `server.http_address` enables plaintext HTTP/1.1 and the legacy ICE request-line adapter. It is empty by default. `server.https_address` serves HTTP/1.1 and HTTP/2. `server.http3_address` serves QUIC on UDP, normally using the same port number. `public_https_port` controls the advertised `Alt-Svc` port.
 
-`server.demo_enabled` controls the built-in player page at `/demo`. It is enabled by default and can be toggled live through the admin config API; set it to `false` to stop serving the page without a restart.
-
 `server.hls_enabled` controls live HLS output (`.m3u8` playlists and MPEG-TS segments) for mounts with the `mp3` or `aac-adts` profile. It is enabled by default and can be toggled live.
 
 Changing any listener address at runtime requires a restart.

@@ -20,7 +20,6 @@ import (
 
 	"github.com/Master290/kite/internal/config"
 	"github.com/Master290/kite/internal/stream"
-	"github.com/Master290/kite/internal/web"
 	"github.com/coder/websocket"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/quic-go/quic-go/http3"
@@ -231,7 +230,6 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 	mux.HandleFunc("/_kite/v1/playlist.m3u", s.handlePlaylist)
 	mux.HandleFunc("/status-json.xsl", s.handleStatus)
 	mux.HandleFunc("/admin/metadata", s.handleMetadata)
-	mux.HandleFunc("/demo", s.handleDemo)
 }
 
 func (s *Server) registerAdmin(mux *http.ServeMux) {
@@ -533,20 +531,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			sub.RecordWrite(len(result.chunk.Data))
 		}
 	}
-}
-
-func (s *Server) handleDemo(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if !s.Config().Server.DemoPage() {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write(web.DemoHTML)
 }
 
 func (s *Server) handlePlaylist(w http.ResponseWriter, r *http.Request) {

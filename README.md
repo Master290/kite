@@ -19,9 +19,8 @@ The project is an early implementation. Its current focus is a dependable single
 - Development TLS, hot-reloaded certificate files, or built-in ACME.
 - Atomic YAML configuration updates with revision ETags.
 - Prometheus metrics on a separate control-plane listener.
-- Built-in player page at `/demo` with live metadata (disable with `server.demo_enabled: false`).
 - Shared byte-bounded ring per mount; listeners keep cursors instead of private audio queues.
-- TypeScript browser SDK and a small demo player.
+- TypeScript browser SDK for native audio and WebSocket listeners.
 
 Kite does not transcode audio. Browser playback depends on codec support in the browser. HLS/DASH, AutoDJ scheduling, listener authentication, clustering, and Shoutcast DSP ingest are not part of the current release.
 

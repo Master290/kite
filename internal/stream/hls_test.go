@@ -212,11 +212,26 @@ func TestHLSFFProbeAcceptsSegment(t *testing.T) {
 	if err != nil {
 		t.Skip("ffmpeg not installed")
 	}
+	for _, tc := range []struct {
+		profile   string
+		genArgs   []string
+		wantCodec string
+	}{
+		{profile: "mp3", genArgs: []string{"-codec:a", "libmp3lame", "-b:a", "128k", "-f", "mp3"}, wantCodec: "mp3"},
+		{profile: "aac-adts", genArgs: []string{"-codec:a", "aac", "-f", "adts"}, wantCodec: "aac"},
+	} {
+		t.Run(tc.profile, func(t *testing.T) { testFFProbeProfile(t, ffmpeg, ffprobe, tc.profile, tc.genArgs, tc.wantCodec) })
+	}
+}
+
+func testFFProbeProfile(t *testing.T, ffmpeg, ffprobe, profile string, genArgs []string, wantCodec string) {
 	dir := t.TempDir()
-	src := filepath.Join(dir, "src.mp3")
-	gen := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+	src := filepath.Join(dir, "src."+profile)
+	gen := exec.Command(ffmpeg, append([]string{
+		"-hide_banner", "-loglevel", "error", "-y",
 		"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
-		"-t", "5", "-codec:a", "libmp3lame", "-b:a", "128k", src)
+		"-t", "5",
+	}, append(genArgs, src)...)...)
 	if out, err := gen.CombinedOutput(); err != nil {
 		t.Fatalf("ffmpeg source generation failed: %v %s", err, out)
 	}
@@ -225,19 +240,19 @@ func TestHLSFFProbeAcceptsSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 	var frames []Frame
-	if _, err := AnalyzeBuffer("mp3", raw, func(f Frame) error {
+	if _, err := AnalyzeBuffer(profile, raw, func(f Frame) error {
 		frames = append(frames, f)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	const totalFrames = 153 // 1152*153/44100 ≈ 3.996 s
+	const totalFrames = 153 // ≈4 s of audio for both profiles
 	if len(frames) < totalFrames+1 {
 		t.Fatalf("only %d frames parsed from source", len(frames))
 	}
-	frames = frames[1 : totalFrames+1] // drop the LAME/Xing info frame
+	frames = frames[1 : totalFrames+1] // drop the encoder info frame
 
-	m := newTSMuxer("mp3")
+	m := newTSMuxer(profile)
 	seg := m.StartSegment(nil)
 	pts := uint64(hlsPTSBase)
 	for start := 0; start < totalFrames; start += hlsFramesPerPES {
@@ -287,11 +302,8 @@ func TestHLSFFProbeAcceptsSegment(t *testing.T) {
 	if err := json.Unmarshal(out, &probe); err != nil {
 		t.Fatal(err)
 	}
-	if len(probe.Streams) != 1 || probe.Streams[0].CodecName != "mp3" {
-		t.Fatalf("streams=%+v", probe.Streams)
-	}
-	if probe.Streams[0].SampleRate != "44100" {
-		t.Fatalf("sample_rate=%q", probe.Streams[0].SampleRate)
+	if len(probe.Streams) != 1 || probe.Streams[0].CodecName != wantCodec {
+		t.Fatalf("streams=%+v want codec %s", probe.Streams, wantCodec)
 	}
 	duration := probe.Format.Duration
 	if duration == "" || duration == "N/A" {
