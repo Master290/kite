@@ -50,8 +50,13 @@ type Server struct {
 	IdleTimeout          Duration `yaml:"idle_timeout" json:"idle_timeout"`
 	ShutdownTimeout      Duration `yaml:"shutdown_timeout" json:"shutdown_timeout"`
 	MaxHeaderBytes       int      `yaml:"max_header_bytes" json:"max_header_bytes"`
+	DemoEnabled          *bool    `yaml:"demo_enabled,omitempty" json:"demo_enabled,omitempty"`
 	TrustedProxyNetworks []string `yaml:"trusted_proxy_networks,omitempty" json:"trusted_proxy_networks,omitempty"`
 }
+
+// DemoPage reports whether the built-in /demo player page is served. It
+// defaults to true and can be toggled live through the admin config API.
+func (s Server) DemoPage() bool { return s.DemoEnabled == nil || *s.DemoEnabled }
 
 type Admin struct {
 	Address   string `yaml:"address" json:"address"`
@@ -188,6 +193,10 @@ func (c *Config) Normalize(baseDir string) error {
 	}
 	if c.Server.MaxHeaderBytes == 0 {
 		c.Server.MaxHeaderBytes = 32 << 10
+	}
+	if c.Server.DemoEnabled == nil {
+		demoEnabled := true
+		c.Server.DemoEnabled = &demoEnabled
 	}
 	if c.Admin.Address == "" {
 		c.Admin.Address = "127.0.0.1:9090"

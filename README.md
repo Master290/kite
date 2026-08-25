@@ -18,6 +18,7 @@ The project is an early implementation. Its current focus is a dependable single
 - Development TLS, hot-reloaded certificate files, or built-in ACME.
 - Atomic YAML configuration updates with revision ETags.
 - Prometheus metrics on a separate control-plane listener.
+- Built-in player page at `/demo` with live metadata (disable with `server.demo_enabled: false`).
 - Shared byte-bounded ring per mount; listeners keep cursors instead of private audio queues.
 - TypeScript browser SDK and a small demo player.
 
@@ -119,6 +120,8 @@ The control plane binds to loopback by default. Send `Authorization: Bearer $KIT
 - `GET /readyz` — listener readiness.
 
 Changes to listener addresses, admin bind address, or TLS mode require a restart and return HTTP `409`. Mounts, credentials, metadata, fallbacks, timeouts, buffers, and CORS rules are applied live.
+
+Set `KITE_PPROF=1` to expose token-protected Go pprof handlers under `/debug/pprof/` on the control plane for production diagnostics.
 
 ## Development
 

@@ -20,11 +20,13 @@ import (
 
 	"github.com/Master290/kite/internal/config"
 	"github.com/Master290/kite/internal/stream"
+	"github.com/Master290/kite/internal/web"
 	"github.com/coder/websocket"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/net/http2"
+	"net/http/pprof"
 )
 
 var ErrRestartRequired = errors.New("restart required for this configuration change")
@@ -229,6 +231,7 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 	mux.HandleFunc("/_kite/v1/playlist.m3u", s.handlePlaylist)
 	mux.HandleFunc("/status-json.xsl", s.handleStatus)
 	mux.HandleFunc("/admin/metadata", s.handleMetadata)
+	mux.HandleFunc("/demo", s.handleDemo)
 }
 
 func (s *Server) registerAdmin(mux *http.ServeMux) {
@@ -250,6 +253,19 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready\n"))
 	})
+	if os.Getenv("KITE_PPROF") == "1" {
+		registerPprof(mux, s.adminAuth)
+	}
+}
+
+// registerPprof attaches Go runtime profiling handlers behind the admin token.
+func registerPprof(mux *http.ServeMux, auth func(http.HandlerFunc) http.HandlerFunc) {
+	authed := func(h http.HandlerFunc) http.HandlerFunc { return auth(func(w http.ResponseWriter, r *http.Request) { h(w, r) }) }
+	mux.HandleFunc("/debug/pprof/", authed(pprof.Index))
+	mux.HandleFunc("/debug/pprof/cmdline", authed(pprof.Cmdline))
+	mux.HandleFunc("/debug/pprof/profile", authed(pprof.Profile))
+	mux.HandleFunc("/debug/pprof/symbol", authed(pprof.Symbol))
+	mux.HandleFunc("/debug/pprof/trace", authed(pprof.Trace))
 }
 
 func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
@@ -513,6 +529,20 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			sub.RecordWrite(len(result.chunk.Data))
 		}
 	}
+}
+
+func (s *Server) handleDemo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.Config().Server.DemoPage() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(web.DemoHTML)
 }
 
 func (s *Server) handlePlaylist(w http.ResponseWriter, r *http.Request) {

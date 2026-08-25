@@ -12,6 +12,7 @@
 | `GET /_kite/v1/ws?mount=/radio` | WebSocket audio and JSON events |
 | `GET /_kite/v1/playlist.m3u?mount=/radio` | Absolute M3U playlist |
 | `GET /status-json.xsl` | Mount status JSON |
+| `GET /demo` | Built-in player page (disable with `server.demo_enabled: false`) |
 | `GET /healthz` | Process health on the admin listener |
 | `GET /readyz` | Listener readiness on the admin listener |
 
@@ -34,4 +35,8 @@ Admin endpoints require `Authorization: Bearer <KITE_ADMIN_TOKEN>`.
 | `GET` | `/metrics` | Prometheus exposition |
 
 Use `If-Match` with the config `ETag` to avoid overwriting a newer revision. Listener addresses, admin bind settings, and TLS mode require a restart.
+
+## Runtime profiling
+
+Set the environment variable `KITE_PPROF=1` and restart to expose Go pprof handlers on the admin listener under `/debug/pprof/`. The handlers require the admin bearer token like every other control-plane endpoint, and the admin listener binds to loopback by default.
 

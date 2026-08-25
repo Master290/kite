@@ -19,7 +19,8 @@ import (
 
 // publicServer wires a Server with two mounts behind an httptest.Server:
 // /radio is public and listed in Icecast status, /private is hidden.
-func publicServer(t *testing.T) (*Server, *httptest.Server) {
+// Optional mutators adjust the config before the server is built.
+func publicServer(t *testing.T, mutators ...func(*config.Config)) (*Server, *httptest.Server) {
 	t.Helper()
 	t.Setenv("SOURCE_PASSWORD", "source")
 	source := config.SourceCredential{Username: "source", PasswordEnv: "SOURCE_PASSWORD"}
@@ -36,6 +37,9 @@ func publicServer(t *testing.T) (*Server, *httptest.Server) {
 			{Path: "/radio", Profile: "mp3", ContentType: "audio/mpeg", Source: source, ICYMetaInterval: 256, Metadata: config.Metadata{Name: "Kite Test", Public: true}, CORSOrigins: []string{"*"}},
 			{Path: "/private", Profile: "mp3", ContentType: "audio/mpeg", Source: source, Metadata: config.Metadata{Name: "Hidden", Public: false}, Hidden: true},
 		},
+	}
+	for _, mutate := range mutators {
+		mutate(cfg)
 	}
 	s, err := New(cfg, t.TempDir()+"/kite.yaml", nil)
 	if err != nil {
