@@ -18,8 +18,22 @@ jobs:
           cache: true
       - run: go test -race ./...
       - run: go vet ./...
-      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
       - run: go build ./cmd/kite
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.6"
+          cache: true
+      # Each target runs exactly one fuzz function; seeds execute even with -run '^$'.
+      - run: go test ./internal/stream/ -run '^$' -fuzz FuzzPumpMP3 -fuzztime 60s
+      - run: go test ./internal/stream/ -run '^$' -fuzz FuzzPumpADTS -fuzztime 60s
+      - run: go test ./internal/stream/ -run '^$' -fuzz FuzzPumpOgg -fuzztime 60s
+      - run: go test ./internal/stream/ -run '^$' -fuzz FuzzPumpOpaque -fuzztime 30s
 
   sdk:
     runs-on: ubuntu-latest

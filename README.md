@@ -126,6 +126,7 @@ Changes to listener addresses, admin bind address, or TLS mode require a restart
 go test ./...
 go vet ./...
 go build ./cmd/kite
+go test ./internal/stream/ -run '^$' -fuzz FuzzPumpMP3 -fuzztime 60s
 go run ./cmd/kitebench -url https://localhost:8443/radio -listeners 1000 -duration 30s -insecure
 
 cd sdk
@@ -138,7 +139,7 @@ python -m pip install -r requirements-docs.txt
 python -m mkdocs serve
 ```
 
-Linux CI also runs the race detector. See [architecture](docs/architecture.md) for the data flow and safety model.
+Linux CI also runs the race detector and bounded fuzzing of the media framers. See [architecture](docs/architecture.md) for the data flow and safety model.
 
 ## License
 

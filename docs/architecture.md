@@ -24,3 +24,5 @@ Only one source may own a mount. The runtime monitors the timestamp of the last 
 Configuration is parsed with strict field checking and validated as a complete graph. Runtime changes prepare a new mount map, persist canonical YAML with `fsync` and rename, then replace the active snapshot. Listener and TLS bind changes are deliberately restart-only.
 
 Labels in Prometheus metrics are limited to configured mount, transport, reason, and fallback target. Client IPs and arbitrary metadata never become labels.
+
+The passthrough framers in `internal/stream/framer.go` parse untrusted encoder bytes, so they are covered by native Go fuzz targets (`internal/stream/fuzz_test.go`) asserting that no input can panic, hang, or emit more bytes than it consumed. CI runs each target for a bounded time on every push; failures are minimized into `testdata/fuzz` corpora.
