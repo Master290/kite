@@ -53,7 +53,7 @@ Check `/readyz`, source connection, listener count, and certificate expiry after
 
 ## Capacity baseline
 
-Measured with [`cmd/kitebench`](../cmd/kitebench/main.go) against a single Kite node serving one 128 kbps MP3 mount over HTTPS (HTTP/1.1, TLS, dev machine, Windows/amd64). Treat the numbers as an order-of-magnitude reference, not a guarantee:
+Measured with `cmd/kitebench` against a single Kite node serving one 128 kbps MP3 mount over HTTPS (HTTP/1.1, TLS, dev machine, Windows/amd64). Treat the numbers as an order-of-magnitude reference, not a guarantee:
 
 | Listeners | Connected | Throughput | Server CPU | Server RSS |
 | --- | --- | --- | --- | --- |
