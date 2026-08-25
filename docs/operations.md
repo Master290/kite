@@ -51,3 +51,20 @@ docker compose -f compose.production.yaml ps
 
 Check `/readyz`, source connection, listener count, and certificate expiry after each update.
 
+## Capacity baseline
+
+Measured with [`cmd/kitebench`](../cmd/kitebench/main.go) against a single Kite node serving one 128 kbps MP3 mount over HTTPS (HTTP/1.1, TLS, dev machine, Windows/amd64). Treat the numbers as an order-of-magnitude reference, not a guarantee:
+
+| Listeners | Connected | Throughput | Server CPU | Server RSS |
+| --- | --- | --- | --- | --- |
+| 1000 | 850 | 108 Mbps | ~0.35 cores over 15 s | 20 MB |
+| 5000 | 5000 | 606 Mbps | ~2.8 cores over 15 s | 187 MB |
+
+Per-listener cost is roughly 37 KB of RSS and well under 1% of a core at 128 kbps. The first run's 150 failed connections were client-side ephemeral-port exhaustion on the load generator, not server refusals; rerunning with 5000 listeners connected all of them. Reproduce with:
+
+```bash
+go run ./cmd/kitebench -url https://localhost:8443/radio -listeners 5000 -duration 15s -insecure
+```
+
+For higher scale, put a CDN or reverse proxy in front for HLS (once available) rather than scaling a single node's HTTP fan-out.
+
