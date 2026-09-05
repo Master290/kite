@@ -3,509 +3,54 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Kite — Streaming Server</title>
-  <style>
-    :root {
-      --bg: #090d14;
-      --card-bg: #121824;
-      --card-hover: #182030;
-      --border: #222d3d;
-      --border-active: #38bdf8;
-      --text: #f1f5f9;
-      --text-muted: #94a3b8;
-      --primary: #0284c7;
-      --primary-hover: #0369a1;
-      --accent: #38bdf8;
-      --live: #10b981;
-      --fallback: #f59e0b;
-      --offline: #64748b;
-      --radius: 1rem;
-      --font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-
-    body {
-      background-color: var(--bg);
-      color: var(--text);
-      font-family: var(--font);
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      line-height: 1.5;
-      -webkit-font-smoothing: antialiased;
-    }
-
-    .container {
-      width: min(1100px, calc(100% - 2.5rem));
-      margin: 0 auto;
-    }
-
-    header {
-      padding: 2.5rem 0 1.5rem;
-      border-bottom: 1px solid var(--border);
-      background: radial-gradient(circle at 50% -20%, rgba(56, 189, 248, 0.08) 0%, transparent 70%);
-    }
-
-    .header-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 1.25rem;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 0.85rem;
-    }
-
-    .logo-icon {
-      width: 2.75rem;
-      height: 2.75rem;
-      background: linear-gradient(135deg, #38bdf8, #0284c7);
-      border-radius: 0.75rem;
-      display: grid;
-      place-items: center;
-      box-shadow: 0 0.5rem 1.5rem rgba(2, 132, 199, 0.35);
-    }
-
-    .logo-icon svg {
-      width: 1.6rem;
-      height: 1.6rem;
-      fill: none;
-      stroke: #ffffff;
-      stroke-width: 2.2;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-    }
-
-    .brand-title {
-      font-size: 1.6rem;
-      font-weight: 800;
-      letter-spacing: -0.02em;
-      display: flex;
-      align-items: center;
-      gap: 0.6rem;
-    }
-
-    .brand-subtitle {
-      font-size: 0.8rem;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      font-weight: 600;
-    }
-
-    .server-status {
-      display: flex;
-      align-items: center;
-      gap: 1.5rem;
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      padding: 0.5rem 1.25rem;
-      border-radius: 9999px;
-      font-size: 0.875rem;
-    }
-
-    .status-item {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .pulse-dot {
-      width: 0.65rem;
-      height: 0.65rem;
-      background-color: var(--live);
-      border-radius: 50%;
-      box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
-      animation: pulse 2s infinite cubic-bezier(0.4, 0, 0.6, 1);
-    }
-
-    @keyframes pulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.4; transform: scale(0.85); }
-    }
-
-    main {
-      flex: 1;
-      padding: 2.5rem 0 3.5rem;
-    }
-
-    .section-header {
-      margin-bottom: 1.75rem;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-
-    .section-title {
-      font-size: 1.25rem;
-      font-weight: 700;
-      color: var(--text);
-    }
-
-    .mount-count {
-      color: var(--text-muted);
-      font-size: 0.9rem;
-      font-weight: 500;
-    }
-
-    .mounts-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(min(100%, 500px), 1fr));
-      gap: 1.5rem;
-    }
-
-    .card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 1.5rem;
-      display: flex;
-      flex-direction: column;
-      gap: 1.25rem;
-      transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
-      position: relative;
-      overflow: hidden;
-    }
-
-    .card:hover {
-      border-color: #334155;
-      box-shadow: 0 1rem 2.5rem rgba(0, 0, 0, 0.35);
-    }
-
-    .card.is-playing {
-      border-color: var(--border-active);
-      box-shadow: 0 0 2rem rgba(56, 189, 248, 0.15);
-    }
-
-    .card-header {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 1rem;
-    }
-
-    .mount-info {
-      display: flex;
-      flex-direction: column;
-      gap: 0.2rem;
-    }
-
-    .mount-path {
-      font-size: 1.2rem;
-      font-weight: 700;
-      color: var(--text);
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .mount-desc {
-      font-size: 0.85rem;
-      color: var(--text-muted);
-    }
-
-    .badges {
-      display: flex;
-      align-items: center;
-      gap: 0.4rem;
-      flex-wrap: wrap;
-    }
-
-    .badge {
-      font-size: 0.725rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      padding: 0.2rem 0.55rem;
-      border-radius: 0.4rem;
-      background: #1e293b;
-      color: #cbd5e1;
-      border: 1px solid #334155;
-    }
-
-    .badge-live {
-      background: rgba(16, 185, 129, 0.15);
-      color: #34d399;
-      border-color: rgba(16, 185, 129, 0.3);
-    }
-
-    .badge-fallback {
-      background: rgba(245, 158, 11, 0.15);
-      color: #fbbf24;
-      border-color: rgba(245, 158, 11, 0.3);
-    }
-
-    .badge-offline {
-      background: rgba(100, 116, 139, 0.15);
-      color: #94a3b8;
-      border-color: rgba(100, 116, 139, 0.3);
-    }
-
-    .now-playing {
-      background: rgba(15, 23, 42, 0.6);
-      border: 1px solid var(--border);
-      border-radius: 0.75rem;
-      padding: 0.85rem 1rem;
-      display: flex;
-      align-items: center;
-      gap: 0.75rem;
-    }
-
-    .track-icon {
-      color: var(--accent);
-      flex-shrink: 0;
-      display: grid;
-      place-items: center;
-    }
-
-    .track-details {
-      min-width: 0;
-      flex: 1;
-    }
-
-    .track-label {
-      font-size: 0.7rem;
-      font-weight: 700;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-    }
-
-    .track-title {
-      font-size: 0.95rem;
-      font-weight: 600;
-      color: var(--text);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .card-footer {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding-top: 0.75rem;
-      border-top: 1px solid var(--border);
-      gap: 1rem;
-    }
-
-    .listener-stat {
-      display: flex;
-      align-items: center;
-      gap: 0.4rem;
-      color: var(--text-muted);
-      font-size: 0.85rem;
-    }
-
-    .controls {
-      display: flex;
-      align-items: center;
-      gap: 0.6rem;
-    }
-
-    .play-btn {
-      background: var(--primary);
-      color: #ffffff;
-      border: 0;
-      border-radius: 9999px;
-      padding: 0.6rem 1.15rem;
-      font-size: 0.875rem;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      gap: 0.45rem;
-      cursor: pointer;
-      transition: background 0.15s ease, transform 0.1s ease;
-    }
-
-    .play-btn:hover {
-      background: var(--primary-hover);
-      transform: translateY(-1px);
-    }
-
-    .play-btn.playing {
-      background: #e11d48;
-    }
-
-    .play-btn.playing:hover {
-      background: #be123c;
-    }
-
-    .play-btn svg {
-      width: 1rem;
-      height: 1rem;
-      fill: currentColor;
-    }
-
-    .link-group {
-      display: flex;
-      gap: 0.35rem;
-    }
-
-    .icon-link {
-      color: var(--text-muted);
-      border: 1px solid var(--border);
-      border-radius: 0.5rem;
-      padding: 0.45rem;
-      display: grid;
-      place-items: center;
-      text-decoration: none;
-      transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
-    }
-
-    .icon-link:hover {
-      color: var(--text);
-      border-color: #475569;
-      background: #1e293b;
-    }
-
-    .icon-link svg {
-      width: 1rem;
-      height: 1rem;
-    }
-
-    /* Wave visualizer */
-    .visualizer {
-      display: flex;
-      align-items: flex-end;
-      gap: 2px;
-      height: 14px;
-      margin-left: 0.25rem;
-    }
-
-    .visualizer-bar {
-      width: 3px;
-      height: 100%;
-      background-color: #ffffff;
-      border-radius: 1px;
-      animation: wave 1s ease-in-out infinite alternate;
-    }
-
-    .visualizer-bar:nth-child(2) { animation-delay: 0.2s; }
-    .visualizer-bar:nth-child(3) { animation-delay: 0.4s; }
-
-    @keyframes wave {
-      0% { height: 20%; }
-      100% { height: 100%; }
-    }
-
-    .empty-state {
-      text-align: center;
-      padding: 4rem 2rem;
-      background: var(--card-bg);
-      border: 1px dashed var(--border);
-      border-radius: var(--radius);
-      color: var(--text-muted);
-    }
-
-    .empty-state h3 {
-      font-size: 1.2rem;
-      color: var(--text);
-      margin-bottom: 0.5rem;
-    }
-
-    footer {
-      border-top: 1px solid var(--border);
-      padding: 1.5rem 0;
-      color: var(--text-muted);
-      font-size: 0.85rem;
-    }
-
-    .footer-content {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 1rem;
-    }
-
-    .footer-links {
-      display: flex;
-      gap: 1.25rem;
-    }
-
-    .footer-links a {
-      color: var(--text-muted);
-      text-decoration: none;
-      transition: color 0.15s ease;
-    }
-
-    .footer-links a:hover {
-      color: var(--accent);
-    }
-  </style>
+  <title>Kite - Server Status</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
-<body>
-  <header>
-    <div class="container header-bar">
-      <div class="brand">
-        <div class="logo-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24"><path d="M12 2L2 9l10 13 10-13-10-7z"/></svg>
-        </div>
-        <div>
-          <div class="brand-title">Kite</div>
-          <div class="brand-subtitle">Streaming Server</div>
-        </div>
-      </div>
-      <div class="server-status">
-        <div class="status-item">
-          <div class="pulse-dot"></div>
-          <span>Online</span>
-        </div>
-        <div class="status-item">
-          <strong id="header-listeners">0</strong>&nbsp;<span>listeners</span>
-        </div>
-      </div>
-    </div>
-  </header>
-
-  <main>
+<body class="bg-light">
+  <nav class="navbar navbar-expand navbar-dark bg-dark mb-4">
     <div class="container">
-      <div class="section-header">
-        <h2 class="section-title">Mount Points</h2>
-        <span class="mount-count" id="mount-count">Loading...</span>
-      </div>
-
-      <div class="mounts-grid" id="mounts-grid">
-        <div class="empty-state">
-          <h3>Discovering streams...</h3>
-          <p>Connecting to Kite streaming server</p>
-        </div>
+      <a class="navbar-brand fw-bold" href="/">Kite</a>
+      <div class="navbar-nav ms-auto">
+        <span class="navbar-text me-3">
+          <span class="badge bg-success">Online</span>
+        </span>
+        <span class="navbar-text">
+          Listeners: <strong id="total-listeners">0</strong>
+        </span>
       </div>
     </div>
-  </main>
+  </nav>
 
-  <footer>
-    <div class="container footer-content">
-      <div>Kite Streaming Server &bull; Icecast Compatible</div>
-      <div class="footer-links">
-        <a href="/status-json.xsl" target="_blank" rel="noopener">JSON Stats</a>
-        <a href="https://master290.github.io/kite/" target="_blank" rel="noopener">Docs</a>
-        <a href="https://github.com/Master290/kite" target="_blank" rel="noopener">GitHub</a>
+  <div class="container">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <h1 class="h4 mb-0">Mount Points</h1>
+      <span class="text-muted small" id="mounts-count">Loading streams...</span>
+    </div>
+
+    <div id="mounts-container">
+      <div class="card shadow-sm text-center py-5 text-muted">
+        <p class="mb-0">Loading status...</p>
       </div>
     </div>
-  </footer>
 
-  <audio id="global-audio" preload="none"></audio>
+    <footer class="pt-4 my-md-5 pt-md-5 border-top text-center text-muted small">
+      <p class="mb-1">Kite Streaming Server &bull; Icecast Compatible</p>
+      <ul class="list-inline mb-0">
+        <li class="list-inline-item"><a href="/status-json.xsl" class="text-decoration-none">JSON Status</a></li>
+        <li class="list-inline-item">&bull;</li>
+        <li class="list-inline-item"><a href="https://master290.github.io/kite/" class="text-decoration-none" target="_blank" rel="noopener">Documentation</a></li>
+        <li class="list-inline-item">&bull;</li>
+        <li class="list-inline-item"><a href="https://github.com/Master290/kite" class="text-decoration-none" target="_blank" rel="noopener">GitHub</a></li>
+      </ul>
+    </footer>
+  </div>
 
   <script>
     (function () {
-      const audio = document.getElementById("global-audio");
-      const grid = document.getElementById("mounts-grid");
-      const mountCountEl = document.getElementById("mount-count");
-      const headerListenersEl = document.getElementById("header-listeners");
-
-      let currentPlayingMount = null;
-      let eventSources = {};
-
-      function formatNumber(num) {
-        return new Intl.NumberFormat().format(num || 0);
-      }
+      const container = document.getElementById("mounts-container");
+      const mountsCountEl = document.getElementById("mounts-count");
+      const totalListenersEl = document.getElementById("total-listeners");
+      const eventSources = {};
 
       function escapeHtml(str) {
         if (!str) return "";
@@ -519,108 +64,66 @@
 
       function renderMounts(items) {
         if (!items || items.length === 0) {
-          grid.innerHTML = `
-            <div class="empty-state">
-              <h3>No active streams</h3>
-              <p>Connect an Icecast source client to begin broadcasting.</p>
+          container.innerHTML = `
+            <div class="card shadow-sm text-center py-5 text-muted">
+              <p class="mb-1 fw-semibold">No active streams</p>
+              <p class="small mb-0">Connect an Icecast source to start broadcasting.</p>
             </div>
           `;
-          mountCountEl.textContent = "0 active";
-          headerListenersEl.textContent = "0";
+          mountsCountEl.textContent = "0 active";
+          totalListenersEl.textContent = "0";
           return;
         }
 
-        mountCountEl.textContent = `${items.length} ${items.length === 1 ? "mount" : "mounts"}`;
+        mountsCountEl.textContent = `${items.length} ${items.length === 1 ? "mount" : "mounts"}`;
         let totalListeners = 0;
 
-        grid.innerHTML = items.map((m) => {
+        container.innerHTML = items.map((m) => {
           totalListeners += m.listeners || 0;
-          const isPlaying = currentPlayingMount === m.path;
-          
-          let statusBadgeClass = "badge-offline";
+          let badgeClass = "bg-secondary";
           let statusText = "Offline";
+
           if (m.source_connected) {
-            statusBadgeClass = "badge-live";
+            badgeClass = "bg-success";
             statusText = "Live";
           } else if (m.active_source && m.active_source !== "none") {
-            statusBadgeClass = "badge-fallback";
+            badgeClass = "bg-warning text-dark";
             statusText = m.active_source;
           }
 
           const profile = (m.profile || "audio").toUpperCase();
           const title = m.metadata?.title || "Live Stream";
-          const hlsUrl = `${m.path}.m3u8`;
+          const streamName = m.server_name || m.name || m.description || "";
           const m3uUrl = `/_kite/v1/playlist.m3u?mount=${encodeURIComponent(m.path)}`;
 
           return `
-            <div class="card ${isPlaying ? 'is-playing' : ''}" id="card-${encodeURIComponent(m.path)}">
-              <div class="card-header">
-                <div class="mount-info">
-                  <div class="mount-path">${escapeHtml(m.path)}</div>
-                  <div class="mount-desc">${escapeHtml(m.name || m.description || "Icecast Audio Stream")}</div>
+            <div class="card shadow-sm mb-3">
+              <div class="card-header bg-white d-flex justify-content-between align-items-center py-3">
+                <div>
+                  <span class="fw-bold fs-5">${escapeHtml(m.path)}</span>
+                  ${streamName ? `<span class="text-muted ms-2">${escapeHtml(streamName)}</span>` : ""}
                 </div>
-                <div class="badges">
-                  <span class="badge ${statusBadgeClass}" id="badge-${encodeURIComponent(m.path)}">${escapeHtml(statusText)}</span>
-                  <span class="badge">${escapeHtml(profile)}</span>
-                </div>
-              </div>
-
-              <div class="now-playing">
-                <div class="track-icon">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M9 18V5l12-2v13"></path>
-                    <circle cx="6" cy="18" r="3"></circle>
-                    <circle cx="18" cy="16" r="3"></circle>
-                  </svg>
-                </div>
-                <div class="track-details">
-                  <div class="track-label">Now Playing</div>
-                  <div class="track-title" id="title-${encodeURIComponent(m.path)}">${escapeHtml(title)}</div>
+                <div>
+                  <span class="badge ${badgeClass} me-1" id="badge-${encodeURIComponent(m.path)}">${escapeHtml(statusText)}</span>
+                  <span class="badge bg-secondary">${escapeHtml(profile)}</span>
                 </div>
               </div>
-
-              <div class="card-footer">
-                <div class="listener-stat">
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-                    <circle cx="9" cy="7" r="4"></circle>
-                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-                  </svg>
-                  <span id="listeners-${encodeURIComponent(m.path)}">${formatNumber(m.listeners)}</span> listeners
-                </div>
-
-                <div class="controls">
-                  <button class="play-btn ${isPlaying ? 'playing' : ''}" data-mount="${escapeHtml(m.path)}">
-                    ${isPlaying ? `
-                      <svg viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg>
-                      <span>Pause</span>
-                      <div class="visualizer" aria-hidden="true">
-                        <div class="visualizer-bar"></div>
-                        <div class="visualizer-bar"></div>
-                        <div class="visualizer-bar"></div>
-                      </div>
-                    ` : `
-                      <svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
-                      <span>Play</span>
-                    `}
-                  </button>
-
-                  <div class="link-group">
-                    <a href="${escapeHtml(m3uUrl)}" class="icon-link" title="Download M3U Playlist" download>
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                        <polyline points="7 10 12 15 17 10"></polyline>
-                        <line x1="12" y1="15" x2="12" y2="3"></line>
-                      </svg>
-                    </a>
-                    <a href="${escapeHtml(m.path)}" target="_blank" class="icon-link" title="Direct Stream Link">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
-                        <polyline points="15 3 21 3 21 9"></polyline>
-                        <line x1="10" y1="14" x2="21" y2="3"></line>
-                      </svg>
-                    </a>
+              <div class="card-body">
+                <div class="row align-items-center">
+                  <div class="col-md-6 mb-3 mb-md-0">
+                    <div class="text-muted small">Now Playing:</div>
+                    <div class="fw-semibold text-truncate mb-2" id="title-${encodeURIComponent(m.path)}">${escapeHtml(title)}</div>
+                    <div class="small text-muted">
+                      Listeners: <strong id="listeners-${encodeURIComponent(m.path)}">${m.listeners || 0}</strong>
+                      ${m.content_type ? ` &bull; <code>${escapeHtml(m.content_type)}</code>` : ""}
+                    </div>
+                  </div>
+                  <div class="col-md-6 d-flex flex-column flex-sm-row justify-content-md-end align-items-center gap-2">
+                    <audio controls class="w-100" style="max-width: 320px;" src="${escapeHtml(m.path)}" preload="none"></audio>
+                    <div class="btn-group">
+                      <a href="${escapeHtml(m3uUrl)}" class="btn btn-outline-secondary btn-sm" download>M3U</a>
+                      <a href="${escapeHtml(m.path)}" class="btn btn-outline-secondary btn-sm" target="_blank">Direct</a>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -628,14 +131,8 @@
           `;
         }).join("");
 
-        headerListenersEl.textContent = formatNumber(totalListeners);
+        totalListenersEl.textContent = totalListeners;
 
-        // Attach play/pause click handlers
-        document.querySelectorAll(".play-btn").forEach((btn) => {
-          btn.addEventListener("click", () => togglePlay(btn.getAttribute("data-mount")));
-        });
-
-        // Setup SSE listeners for active mounts
         items.forEach((m) => setupSSE(m.path));
       }
 
@@ -661,10 +158,10 @@
             const badgeEl = document.getElementById(`badge-${encodeURIComponent(mount)}`);
             if (badgeEl) {
               if (data.payload?.connected) {
-                badgeEl.className = "badge badge-live";
+                badgeEl.className = "badge bg-success me-1";
                 badgeEl.textContent = "Live";
               } else {
-                badgeEl.className = "badge badge-offline";
+                badgeEl.className = "badge bg-secondary me-1";
                 badgeEl.textContent = "Offline";
               }
             }
@@ -676,54 +173,6 @@
           delete eventSources[mount];
           setTimeout(() => setupSSE(mount), 5000);
         };
-      }
-
-      async function togglePlay(mount) {
-        if (currentPlayingMount === mount) {
-          audio.pause();
-          audio.removeAttribute("src");
-          audio.load();
-          currentPlayingMount = null;
-        } else {
-          currentPlayingMount = mount;
-          audio.src = mount;
-          try {
-            await audio.play();
-          } catch (err) {
-            console.error("Playback failed:", err);
-            currentPlayingMount = null;
-          }
-        }
-        refreshUIPlaybackState();
-      }
-
-      function refreshUIPlaybackState() {
-        document.querySelectorAll(".card").forEach((card) => {
-          const btn = card.querySelector(".play-btn");
-          if (!btn) return;
-          const mount = btn.getAttribute("data-mount");
-          const isPlaying = currentPlayingMount === mount;
-
-          card.classList.toggle("is-playing", isPlaying);
-          btn.classList.toggle("playing", isPlaying);
-
-          if (isPlaying) {
-            btn.innerHTML = `
-              <svg viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg>
-              <span>Pause</span>
-              <div class="visualizer" aria-hidden="true">
-                <div class="visualizer-bar"></div>
-                <div class="visualizer-bar"></div>
-                <div class="visualizer-bar"></div>
-              </div>
-            `;
-          } else {
-            btn.innerHTML = `
-              <svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
-              <span>Play</span>
-            `;
-          }
-        });
       }
 
       async function fetchStatus() {
@@ -739,16 +188,6 @@
           console.error("Error fetching stats:", err);
         }
       }
-
-      audio.addEventListener("ended", () => {
-        currentPlayingMount = null;
-        refreshUIPlaybackState();
-      });
-
-      audio.addEventListener("error", () => {
-        currentPlayingMount = null;
-        refreshUIPlaybackState();
-      });
 
       fetchStatus();
       setInterval(fetchStatus, 15000);
