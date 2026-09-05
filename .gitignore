@@ -21,4 +21,3 @@ node_modules/
 /testdata/e2e.*
 /testdata/*-e2e.*
 /.prod-local/
-/session-*.md
