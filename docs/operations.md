@@ -66,5 +66,5 @@ Per-listener cost is roughly 37 KB of RSS and well under 1% of a core at 128 kbp
 go run ./cmd/kitebench -url https://localhost:8443/radio -listeners 5000 -duration 15s -insecure
 ```
 
-For higher scale, put a CDN or reverse proxy in front for HLS (once available) rather than scaling a single node's HTTP fan-out.
+For higher scale, put a CDN or reverse proxy in front for HLS rather than scaling a single node's HTTP fan-out.
 

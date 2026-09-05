@@ -13,13 +13,14 @@ Kite is a lightweight Icecast-compatible streaming server written in Go. It acce
 
 - Icecast Source ingest through HTTP `PUT`, `POST`, and legacy `SOURCE ... ICE/1.0`.
 - Passthrough MP3, AAC/ADTS, and Ogg/Opus streaming.
+- Live HLS output for MP3 and AAC mounts.
 - Bounded per-mount buffering with slow-listener protection.
 - Primary, backup-mount, and looping file fallback.
 - ICY metadata, SSE events, WebSocket audio, and Prometheus metrics.
 - Development TLS, file-based certificates, and built-in ACME.
 - Atomic dynamic configuration with revision ETags.
 
-Kite is a single-node streaming server. It does not currently provide transcoding, HLS/DASH, AutoDJ scheduling, clustering, listener authentication, or full Shoutcast DSP compatibility.
+Kite is a single-node streaming server. It does not currently provide transcoding, DASH, AutoDJ scheduling, clustering, listener authentication, or full Shoutcast DSP compatibility.
 
 ## Project links
 
