@@ -136,3 +136,34 @@ func TestAdminCommitDoesNotPersistOnPrepareFailure(t *testing.T) {
 		t.Fatalf("file changed to %q", got)
 	}
 }
+
+func TestAdminConfigRedactsRelayPassword(t *testing.T) {
+	cfg := config.Default()
+	cfg.Mounts = []config.Mount{
+		{
+			Path:    "/relayed",
+			Profile: "mp3",
+			Relay: &config.RelayConfig{
+				URL:      "http://example.com/stream",
+				Username: "user",
+				Password: "supersecretpassword",
+			},
+		},
+	}
+	s := &Server{store: NewConfigStore("", &cfg)}
+
+	redacted := redactedConfig(&cfg)
+	if redacted.Mounts[0].Relay.Password != "<redacted>" {
+		t.Fatalf("expected <redacted>, got %q", redacted.Mounts[0].Relay.Password)
+	}
+	if cfg.Mounts[0].Relay.Password != "supersecretpassword" {
+		t.Fatalf("original password mutated: %q", cfg.Mounts[0].Relay.Password)
+	}
+
+	incoming := *redacted
+	s.restoreRedactedSecrets(&incoming)
+	if incoming.Mounts[0].Relay.Password != "supersecretpassword" {
+		t.Fatalf("expected restored password, got %q", incoming.Mounts[0].Relay.Password)
+	}
+}
+

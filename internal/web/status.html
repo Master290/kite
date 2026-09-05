@@ -85,7 +85,7 @@
 
           if (m.source_connected) {
             badgeClass = "bg-success";
-            statusText = "Live";
+            statusText = m.is_relay ? "Relay" : "Live";
           } else if (m.active_source && m.active_source !== "none") {
             badgeClass = "bg-warning text-dark";
             statusText = m.active_source;
@@ -159,7 +159,7 @@
             if (badgeEl) {
               if (data.payload?.connected) {
                 badgeEl.className = "badge bg-success me-1";
-                badgeEl.textContent = "Live";
+                badgeEl.textContent = data.payload?.is_relay ? "Relay" : "Live";
               } else {
                 badgeEl.className = "badge bg-secondary me-1";
                 badgeEl.textContent = "Offline";

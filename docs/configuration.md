@@ -24,7 +24,7 @@ For a public ACME deployment, point every hostname in `tls.hosts` at the server,
 
 ## Source credentials
 
-Each mount requires exactly one credential source:
+Each mount requires exactly one credential source (unless configured as a `relay` without direct source ingest):
 
 ```yaml
 source:
@@ -33,6 +33,25 @@ source:
 ```
 
 or `password_env`, or `password_file`. Environment and file values may be plaintext or bcrypt hashes. Files and environment variables are resolved at authentication time, allowing secret rotation without a config reload.
+
+## Relay (Master/Slave pull replication)
+
+Mounts can pull an upstream stream from an external Icecast or Kite server:
+
+```yaml
+mounts:
+  - path: /relayed
+    profile: mp3
+    relay:
+      url: "https://upstream.example.com/live"
+      username: relay_user        # optional
+      password_env: RELAY_PASS    # or password, or password_file
+      retry_delay: 3s             # default: 3s
+```
+
+Kite requests ICY metadata (`Icy-MetaData: 1`) from the upstream server, extracts `StreamTitle` metadata updates on the fly without audio artifacts, and distributes the clean audio frames to local listeners.
+
+If `source` credentials are also defined on a relay mount, a live source (e.g. DJ) connecting via `PUT` or `SOURCE` will temporarily preempt the relay stream. When the direct source disconnects, the relay automatically reconnects and resumes.
 
 ## Profiles
 

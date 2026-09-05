@@ -212,6 +212,7 @@ type Mount struct {
 	notify       chan struct{}
 	eventID      uint64
 	source       bool
+	isRelay      bool
 	sourceSince  time.Time
 	lastSource   time.Time
 	active       string
@@ -225,6 +226,9 @@ type Mount struct {
 
 	hls   atomic.Pointer[hlsPackager]
 	hlsMu sync.Mutex
+
+	relayCancel context.CancelFunc
+	relayMu     sync.Mutex
 }
 
 type Status struct {
@@ -232,6 +236,7 @@ type Status struct {
 	Profile        string    `json:"profile"`
 	ContentType    string    `json:"content_type"`
 	Source         bool      `json:"source_connected"`
+	IsRelay        bool      `json:"is_relay,omitempty"`
 	Active         string    `json:"active_source"`
 	Listeners      int       `json:"listeners"`
 	Metadata       Metadata  `json:"metadata"`
@@ -256,11 +261,18 @@ func newMount(parent context.Context, hub *Hub, cfg config.Mount, defaults confi
 		{ID: 1, Type: "source", Mount: cfg.Path, Time: time.Now(), Payload: map[string]any{"connected": false, "active": "silence"}},
 		{ID: 2, Type: "metadata", Mount: cfg.Path, Time: time.Now(), Payload: map[string]any{"title": "", "url": ""}},
 	}
+	if cfg.Relay != nil {
+		m.startRelay(*cfg.Relay)
+	}
 	go m.run()
 	return m
 }
 
-func (m *Mount) stop()                { m.cancel() }
+func (m *Mount) stop() {
+	m.stopRelay()
+	m.cancel()
+}
+
 func (m *Mount) Profile() string      { m.cfgMu.RLock(); defer m.cfgMu.RUnlock(); return m.cfg.Profile }
 func (m *Mount) Config() config.Mount { m.cfgMu.RLock(); defer m.cfgMu.RUnlock(); return m.cfg }
 func (m *Mount) settings() (config.Mount, config.Defaults) {
@@ -270,22 +282,65 @@ func (m *Mount) settings() (config.Mount, config.Defaults) {
 }
 func (m *Mount) Update(cfg config.Mount, defaults config.Defaults) {
 	m.cfgMu.Lock()
+	oldRelay := m.cfg.Relay
 	m.cfg = cfg
 	m.defaults = defaults
 	m.cfgMu.Unlock()
+
+	if cfg.Relay != nil {
+		if oldRelay == nil || *oldRelay != *cfg.Relay {
+			m.startRelay(*cfg.Relay)
+		}
+	} else if oldRelay != nil {
+		m.stopRelay()
+	}
 }
 
 func (m *Mount) AcquireSource() error {
+	m.mu.Lock()
+	if m.source && m.isRelay {
+		closer := m.sourceCloser
+		m.mu.Unlock()
+		if closer != nil {
+			_ = closer.Close()
+		}
+		select {
+		case m.sourceGuard <- struct{}{}:
+		case <-time.After(time.Second):
+			return ErrSourceBusy
+		}
+	} else {
+		m.mu.Unlock()
+		select {
+		case m.sourceGuard <- struct{}{}:
+		default:
+			return ErrSourceBusy
+		}
+	}
+	m.mu.Lock()
+	m.source = true
+	m.isRelay = false
+	m.sourceSince = time.Now()
+	m.lastSource = m.sourceSince
+	m.initChunks = nil
+	m.mu.Unlock()
+	m.observer.SourceConnected(m.Config().Path)
+	m.publish("source", map[string]any{"connected": true, "is_relay": false})
+	return nil
+}
+
+func (m *Mount) AcquireRelaySource() error {
 	select {
 	case m.sourceGuard <- struct{}{}:
 		m.mu.Lock()
 		m.source = true
+		m.isRelay = true
 		m.sourceSince = time.Now()
 		m.lastSource = m.sourceSince
 		m.initChunks = nil
 		m.mu.Unlock()
 		m.observer.SourceConnected(m.Config().Path)
-		m.publish("source", map[string]any{"connected": true})
+		m.publish("source", map[string]any{"connected": true, "is_relay": true})
 		return nil
 	default:
 		return ErrSourceBusy
@@ -300,10 +355,11 @@ func (m *Mount) ReleaseSource() {
 	}
 	m.mu.Lock()
 	m.source = false
+	m.isRelay = false
 	m.sourceCloser = nil
 	m.mu.Unlock()
 	m.observer.SourceDisconnected(m.Config().Path)
-	m.publish("source", map[string]any{"connected": false})
+	m.publish("source", map[string]any{"connected": false, "is_relay": false})
 }
 
 func (m *Mount) SetSourceCloser(closer io.Closer) {
@@ -681,7 +737,7 @@ func (m *Mount) Status() Status {
 			listeners++
 		}
 	}
-	return Status{Path: cfg.Path, Profile: cfg.Profile, ContentType: cfg.ContentType, Source: m.source, Active: m.active, Listeners: listeners, Metadata: m.metadata, LastSource: m.lastSource, BytesIn: m.bytesIn, BytesOut: m.bytesOut, BufferBytes: m.ringBytes, BufferLimit: bufferBytes(cfg, defaults), OldestSequence: m.ringFirst, LatestSequence: m.sequence}
+	return Status{Path: cfg.Path, Profile: cfg.Profile, ContentType: cfg.ContentType, Source: m.source, IsRelay: m.isRelay, Active: m.active, Listeners: listeners, Metadata: m.metadata, LastSource: m.lastSource, BytesIn: m.bytesIn, BytesOut: m.bytesOut, BufferBytes: m.ringBytes, BufferLimit: bufferBytes(cfg, defaults), OldestSequence: m.ringFirst, LatestSequence: m.sequence}
 }
 
 func Copy(ctx context.Context, dst io.Writer, sub subscription) error {

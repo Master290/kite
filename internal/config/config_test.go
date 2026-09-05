@@ -100,3 +100,50 @@ func TestStaticKeyIncludesTLSAndServerSettings(t *testing.T) {
 		t.Fatal("server timeout missing from static key")
 	}
 }
+
+func TestParseRelayConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := Parse([]byte(`
+version: 1
+server: {http_address: "127.0.0.1:8000"}
+tls: {mode: development}
+mounts:
+  - path: /relayed
+    profile: mp3
+    relay:
+      url: "http://example.com/live"
+      password_file: "secrets/relay_pass"
+`), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := cfg.Mounts[0]
+	if m.Relay == nil {
+		t.Fatal("expected relay config to be present")
+	}
+	if m.Relay.URL != "http://example.com/live" {
+		t.Fatalf("relay url=%q", m.Relay.URL)
+	}
+	if m.Relay.RetryDelay.Duration() != 3*time.Second {
+		t.Fatalf("expected 3s retry delay, got %s", m.Relay.RetryDelay.Duration())
+	}
+	if m.Relay.PasswordFile != filepath.Join(dir, "secrets", "relay_pass") {
+		t.Fatalf("relay password file=%q", m.Relay.PasswordFile)
+	}
+
+	// Test invalid scheme
+	_, err = Parse([]byte(`
+version: 1
+server: {http_address: "127.0.0.1:8000"}
+tls: {mode: development}
+mounts:
+  - path: /invalid
+    profile: mp3
+    relay:
+      url: "ftp://example.com/live"
+`), dir)
+	if err == nil {
+		t.Fatal("expected error for non-http/https relay url")
+	}
+}
+

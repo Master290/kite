@@ -724,11 +724,15 @@ func validateFallbackFiles(cfg *config.Config) error {
 func (s *Server) restoreRedactedSecrets(next *config.Config) {
 	current := s.Config()
 	for i := range next.Mounts {
-		if next.Mounts[i].Source.PasswordBcrypt != "<redacted>" {
-			continue
+		if next.Mounts[i].Source.PasswordBcrypt == "<redacted>" {
+			if old, ok := current.Mount(next.Mounts[i].Path); ok {
+				next.Mounts[i].Source.PasswordBcrypt = old.Source.PasswordBcrypt
+			}
 		}
-		if old, ok := current.Mount(next.Mounts[i].Path); ok {
-			next.Mounts[i].Source.PasswordBcrypt = old.Source.PasswordBcrypt
+		if next.Mounts[i].Relay != nil && next.Mounts[i].Relay.Password == "<redacted>" {
+			if old, ok := current.Mount(next.Mounts[i].Path); ok && old.Relay != nil {
+				next.Mounts[i].Relay.Password = old.Relay.Password
+			}
 		}
 	}
 }
@@ -739,6 +743,13 @@ func redactedConfig(current *config.Config) *config.Config {
 	for i := range copyConfig.Mounts {
 		if copyConfig.Mounts[i].Source.PasswordBcrypt != "" {
 			copyConfig.Mounts[i].Source.PasswordBcrypt = "<redacted>"
+		}
+		if copyConfig.Mounts[i].Relay != nil {
+			relayCopy := *copyConfig.Mounts[i].Relay
+			if relayCopy.Password != "" {
+				relayCopy.Password = "<redacted>"
+			}
+			copyConfig.Mounts[i].Relay = &relayCopy
 		}
 	}
 	return &copyConfig

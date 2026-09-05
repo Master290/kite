@@ -95,6 +95,7 @@ type Mount struct {
 	Profile         string           `yaml:"profile" json:"profile"`
 	ContentType     string           `yaml:"content_type,omitempty" json:"content_type,omitempty"`
 	Source          SourceCredential `yaml:"source" json:"source"`
+	Relay           *RelayConfig     `yaml:"relay,omitempty" json:"relay,omitempty"`
 	Metadata        Metadata         `yaml:"metadata,omitempty" json:"metadata,omitempty"`
 	Fallback        []Fallback       `yaml:"fallback,omitempty" json:"fallback,omitempty"`
 	SourceTimeout   Duration         `yaml:"source_timeout,omitempty" json:"source_timeout,omitempty"`
@@ -102,6 +103,15 @@ type Mount struct {
 	BufferDuration  Duration         `yaml:"buffer_duration,omitempty" json:"buffer_duration,omitempty"`
 	ICYMetaInterval int              `yaml:"icy_meta_interval,omitempty" json:"icy_meta_interval,omitempty"`
 	CORSOrigins     []string         `yaml:"cors_origins,omitempty" json:"cors_origins,omitempty"`
+}
+
+type RelayConfig struct {
+	URL          string   `yaml:"url" json:"url"`
+	Username     string   `yaml:"username,omitempty" json:"username,omitempty"`
+	Password     string   `yaml:"password,omitempty" json:"password,omitempty"`
+	PasswordEnv  string   `yaml:"password_env,omitempty" json:"password_env,omitempty"`
+	PasswordFile string   `yaml:"password_file,omitempty" json:"password_file,omitempty"`
+	RetryDelay   Duration `yaml:"retry_delay,omitempty" json:"retry_delay,omitempty"`
 }
 
 type SourceCredential struct {
@@ -322,8 +332,20 @@ func normalizeMount(m *Mount, d Defaults, baseDir string) error {
 	default:
 		return fmt.Errorf("unsupported profile %q", m.Profile)
 	}
-	if m.Source.Username == "" {
-		m.Source.Username = "source"
+	if m.Relay != nil {
+		u, err := url.Parse(m.Relay.URL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("invalid relay url %q", m.Relay.URL)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("relay url scheme must be http or https, got %q", u.Scheme)
+		}
+		if m.Relay.PasswordFile != "" {
+			m.Relay.PasswordFile = absolute(baseDir, m.Relay.PasswordFile)
+		}
+		if m.Relay.RetryDelay == 0 {
+			m.Relay.RetryDelay = Duration(3 * time.Second)
+		}
 	}
 	credentials := 0
 	for _, value := range []string{m.Source.PasswordBcrypt, m.Source.PasswordEnv, m.Source.PasswordFile} {
@@ -331,8 +353,20 @@ func normalizeMount(m *Mount, d Defaults, baseDir string) error {
 			credentials++
 		}
 	}
-	if credentials != 1 {
-		return errors.New("source requires exactly one of password_bcrypt, password_env, or password_file")
+	if m.Relay == nil {
+		if m.Source.Username == "" {
+			m.Source.Username = "source"
+		}
+		if credentials != 1 {
+			return errors.New("source requires exactly one of password_bcrypt, password_env, or password_file")
+		}
+	} else if credentials > 0 {
+		if credentials != 1 {
+			return errors.New("source requires exactly one of password_bcrypt, password_env, or password_file")
+		}
+		if m.Source.Username == "" {
+			m.Source.Username = "source"
+		}
 	}
 	if m.Source.PasswordFile != "" {
 		m.Source.PasswordFile = absolute(baseDir, m.Source.PasswordFile)

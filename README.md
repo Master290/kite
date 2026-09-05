@@ -21,6 +21,7 @@ The project is an early implementation. Its current focus is a dependable single
 - Prometheus metrics on a separate control-plane listener.
 - Shared byte-bounded ring per mount; listeners keep cursors instead of private audio queues.
 - Built-in HTML status and player page with real-time SSE metadata and Icecast `/status.xsl` compatibility.
+- Relay mode: pull upstream streams over HTTP/HTTPS with ICY metadata extraction and live DJ preemption.
 - TypeScript browser SDK for native audio and WebSocket listeners.
 
 Kite does not transcode audio. Browser playback depends on codec support in the browser. DASH, AutoDJ scheduling, listener authentication, clustering, and Shoutcast DSP ingest are not part of the current release.
