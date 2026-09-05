@@ -8,6 +8,8 @@ Kite uses strict, versioned YAML. Unknown fields and invalid fallback graphs pre
 
 `server.hls_enabled` controls live HLS output (`.m3u8` playlists and MPEG-TS segments) for mounts with the `mp3` or `aac-adts` profile. It is enabled by default and can be toggled live.
 
+`server.status_page_enabled` controls the built-in HTML status and player page served at `/`, `/index.html`, and `/status.xsl`. It is enabled by default and can be toggled live.
+
 Changing any listener address at runtime requires a restart.
 
 ## TLS

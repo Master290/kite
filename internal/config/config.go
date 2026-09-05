@@ -51,12 +51,17 @@ type Server struct {
 	ShutdownTimeout      Duration `yaml:"shutdown_timeout" json:"shutdown_timeout"`
 	MaxHeaderBytes       int      `yaml:"max_header_bytes" json:"max_header_bytes"`
 	HLSEnabled           *bool    `yaml:"hls_enabled,omitempty" json:"hls_enabled,omitempty"`
+	StatusPageEnabled    *bool    `yaml:"status_page_enabled,omitempty" json:"status_page_enabled,omitempty"`
 	TrustedProxyNetworks []string `yaml:"trusted_proxy_networks,omitempty" json:"trusted_proxy_networks,omitempty"`
 }
 
 // HLS reports whether `.m3u8` playlists and TS segments are served. It
 // defaults to true and can be toggled live through the admin config API.
 func (s Server) HLS() bool { return s.HLSEnabled == nil || *s.HLSEnabled }
+
+// StatusPage reports whether the built-in status and player page is served.
+// It defaults to true and can be toggled live through the admin config API.
+func (s Server) StatusPage() bool { return s.StatusPageEnabled == nil || *s.StatusPageEnabled }
 
 type Admin struct {
 	Address   string `yaml:"address" json:"address"`

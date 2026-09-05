@@ -11,6 +11,7 @@
 | `GET /_kite/v1/events?mount=/radio` | SSE metadata/source events |
 | `GET /_kite/v1/ws?mount=/radio` | WebSocket audio and JSON events |
 | `GET /_kite/v1/playlist.m3u?mount=/radio` | Absolute M3U playlist |
+| `GET /`, `/index.html`, `/status.xsl` | Built-in HTML status and player page |
 | `GET /status-json.xsl` | Mount status JSON |
 | `GET /radio.m3u8` | Live HLS playlist for MP3 and AAC mounts |
 | `GET /radio.hls/<seq>.ts` | Immutable HLS MPEG-TS segment |

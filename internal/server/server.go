@@ -20,6 +20,7 @@ import (
 
 	"github.com/Master290/kite/internal/config"
 	"github.com/Master290/kite/internal/stream"
+	"github.com/Master290/kite/internal/web"
 	"github.com/coder/websocket"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/quic-go/quic-go/http3"
@@ -276,6 +277,10 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 	}
 	m, ok := s.hub.Get(r.URL.Path)
 	if !ok {
+		if (r.URL.Path == "/" || r.URL.Path == "/index.html" || r.URL.Path == "/status.xsl") && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			s.handleStatusPage(w, r)
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}
@@ -549,11 +554,41 @@ func (s *Server) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprintf(w, "#EXTM3U\n#EXTINF:-1,Kite\n%s%s\n", base, mount)
 }
+func (s *Server) handleStatusPage(w http.ResponseWriter, r *http.Request) {
+	if !s.Config().Server.StatusPage() {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store")
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(web.StatusHTML)
+}
+
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	items := make([]stream.Status, 0)
+	type statusItem struct {
+		stream.Status
+		ServerName        string `json:"server_name,omitempty"`
+		ServerDescription string `json:"server_description,omitempty"`
+		Genre             string `json:"genre,omitempty"`
+	}
+	items := make([]statusItem, 0)
 	for _, st := range s.hub.Status() {
 		if m, ok := s.Config().Mount(st.Path); ok && !m.Hidden && m.Metadata.Public {
-			items = append(items, st)
+			items = append(items, statusItem{
+				Status:            st,
+				ServerName:        m.Metadata.Name,
+				ServerDescription: m.Metadata.Description,
+				Genre:             m.Metadata.Genre,
+			})
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"icestats": map[string]any{"source": items}})
