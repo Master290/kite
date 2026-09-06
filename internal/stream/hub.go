@@ -587,8 +587,23 @@ func (m *Mount) desiredFallback(cfg config.Mount) string {
 			}
 			continue
 		}
-		if _, err := os.Stat(fb.File); err == nil {
-			return "file:" + fb.File
+		if fb.File != "" {
+			if _, err := os.Stat(fb.File); err == nil {
+				return "file:" + fb.File
+			}
+			continue
+		}
+		if fb.Folder != "" {
+			if fi, err := os.Stat(fb.Folder); err == nil && fi.IsDir() {
+				return "folder:" + fb.Folder
+			}
+			continue
+		}
+		if fb.Playlist != "" {
+			if _, err := os.Stat(fb.Playlist); err == nil {
+				return "playlist:" + fb.Playlist
+			}
+			continue
 		}
 	}
 	return "silence"
@@ -628,7 +643,29 @@ func (m *Mount) startFallback(ctx context.Context, cfg config.Mount, desired str
 		}
 		if fb.File != "" && "file:"+fb.File == desired {
 			m.setActive("file:" + fb.File)
+			title := FormatTrackTitle(fb.File, fb.Title)
+			if title != "" {
+				m.SetMetadata(Metadata{Title: title})
+			}
 			go pumpFile(ctx, fb.File, cfg.Profile, cfg.Metadata.Bitrate, out)
+			return out
+		}
+		if fb.Folder != "" && "folder:"+fb.Folder == desired {
+			m.setActive("folder:" + fb.Folder)
+			files, err := scanAudioFolder(fb.Folder, cfg.Profile)
+			if err != nil || len(files) == 0 {
+				continue
+			}
+			go pumpPlaylist(ctx, files, fb.Shuffle, cfg.Profile, cfg.Metadata.Bitrate, fb.Title, m.SetMetadata, out)
+			return out
+		}
+		if fb.Playlist != "" && "playlist:"+fb.Playlist == desired {
+			m.setActive("playlist:" + fb.Playlist)
+			files, err := parsePlaylist(fb.Playlist, cfg.Profile)
+			if err != nil || len(files) == 0 {
+				continue
+			}
+			go pumpPlaylist(ctx, files, fb.Shuffle, cfg.Profile, cfg.Metadata.Bitrate, fb.Title, m.SetMetadata, out)
 			return out
 		}
 	}
@@ -688,9 +725,11 @@ func (m *Mount) setActive(active string) {
 		return
 	}
 	m.active = active
+	connected := m.source
+	isRelay := m.isRelay
 	m.mu.Unlock()
 	m.observer.FallbackSwitch(m.Config().Path, active)
-	m.publish("source", map[string]any{"active": active})
+	m.publish("source", map[string]any{"active": active, "connected": connected, "is_relay": isRelay})
 }
 
 func (m *Mount) broadcast(data []byte, at time.Time) {

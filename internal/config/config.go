@@ -131,9 +131,12 @@ type Metadata struct {
 }
 
 type Fallback struct {
-	Mount string `yaml:"mount,omitempty" json:"mount,omitempty"`
-	File  string `yaml:"file,omitempty" json:"file,omitempty"`
-	Title string `yaml:"title,omitempty" json:"title,omitempty"`
+	Mount    string `yaml:"mount,omitempty" json:"mount,omitempty"`
+	File     string `yaml:"file,omitempty" json:"file,omitempty"`
+	Folder   string `yaml:"folder,omitempty" json:"folder,omitempty"`
+	Playlist string `yaml:"playlist,omitempty" json:"playlist,omitempty"`
+	Shuffle  bool   `yaml:"shuffle,omitempty" json:"shuffle,omitempty"`
+	Title    string `yaml:"title,omitempty" json:"title,omitempty"`
 }
 
 func Default() Config {
@@ -394,14 +397,33 @@ func normalizeMount(m *Mount, d Defaults, baseDir string) error {
 	}
 	for i := range m.Fallback {
 		fb := &m.Fallback[i]
-		if (fb.Mount == "") == (fb.File == "") {
-			return errors.New("fallback requires exactly one of mount or file")
+		count := 0
+		if fb.Mount != "" {
+			count++
+		}
+		if fb.File != "" {
+			count++
+		}
+		if fb.Folder != "" {
+			count++
+		}
+		if fb.Playlist != "" {
+			count++
+		}
+		if count != 1 {
+			return errors.New("fallback requires exactly one of mount, file, folder, or playlist")
 		}
 		if fb.Mount != "" && !strings.HasPrefix(fb.Mount, "/") {
 			return fmt.Errorf("invalid fallback mount %q", fb.Mount)
 		}
 		if fb.File != "" {
 			fb.File = absolute(baseDir, fb.File)
+		}
+		if fb.Folder != "" {
+			fb.Folder = absolute(baseDir, fb.Folder)
+		}
+		if fb.Playlist != "" {
+			fb.Playlist = absolute(baseDir, fb.Playlist)
 		}
 	}
 	for _, origin := range m.CORSOrigins {

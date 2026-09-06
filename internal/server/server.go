@@ -719,11 +719,20 @@ func (s *Server) applyConfig(next *config.Config) { _ = s.hub.Apply(next) }
 func validateFallbackFiles(cfg *config.Config) error {
 	for _, mount := range cfg.Mounts {
 		for _, fallback := range mount.Fallback {
-			if fallback.File == "" {
-				continue
+			if fallback.File != "" {
+				if err := stream.ValidateFile(mount.Profile, fallback.File); err != nil {
+					return fmt.Errorf("mount %s fallback file %s: %w", mount.Path, fallback.File, err)
+				}
 			}
-			if err := stream.ValidateFile(mount.Profile, fallback.File); err != nil {
-				return fmt.Errorf("mount %s fallback file %s: %w", mount.Path, fallback.File, err)
+			if fallback.Folder != "" {
+				if err := stream.ValidateFolder(mount.Profile, fallback.Folder); err != nil {
+					return fmt.Errorf("mount %s fallback folder %s: %w", mount.Path, fallback.Folder, err)
+				}
+			}
+			if fallback.Playlist != "" {
+				if err := stream.ValidatePlaylist(mount.Profile, fallback.Playlist); err != nil {
+					return fmt.Errorf("mount %s fallback playlist %s: %w", mount.Path, fallback.Playlist, err)
+				}
 			}
 		}
 	}

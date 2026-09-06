@@ -147,3 +147,54 @@ mounts:
 	}
 }
 
+func TestParseExtendedFallback(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := Parse([]byte(`
+version: 1
+server: {http_address: "127.0.0.1:8000"}
+tls: {mode: development}
+mounts:
+  - path: /radio
+    profile: mp3
+    source: {password_env: PASS}
+    fallback:
+      - folder: music/hits
+        shuffle: true
+      - playlist: lists/main.m3u
+`), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := cfg.Mounts[0]
+	if len(m.Fallback) != 2 {
+		t.Fatalf("expected 2 fallbacks, got %d", len(m.Fallback))
+	}
+	if m.Fallback[0].Folder != filepath.Join(dir, "music", "hits") {
+		t.Fatalf("expected absolute folder, got %q", m.Fallback[0].Folder)
+	}
+	if !m.Fallback[0].Shuffle {
+		t.Fatal("expected shuffle true")
+	}
+	if m.Fallback[1].Playlist != filepath.Join(dir, "lists", "main.m3u") {
+		t.Fatalf("expected absolute playlist, got %q", m.Fallback[1].Playlist)
+	}
+
+	// Test reject multiple targets in single fallback entry
+	_, err = Parse([]byte(`
+version: 1
+server: {http_address: "127.0.0.1:8000"}
+tls: {mode: development}
+mounts:
+  - path: /radio
+    profile: mp3
+    source: {password_env: PASS}
+    fallback:
+      - file: emergency.mp3
+        folder: music
+`), dir)
+	if err == nil {
+		t.Fatal("expected error when both file and folder specified")
+	}
+}
+
+

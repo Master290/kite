@@ -62,22 +62,33 @@ If `source` credentials are also defined on a relay mount, a live source (e.g. D
 
 Kite parses MP3 frames, ADTS frames, and Ogg pages before fan-out. Every mount in a fallback chain must use the same profile.
 
-## Fallback
+## Fallback (AutoDJ)
 
-Fallback candidates are evaluated in order:
+Fallback candidates are evaluated in order of priority:
 
 ```yaml
 fallback:
   - mount: /backup
-  - file: ./emergency.mp3
-    title: Emergency programming
+  - folder: /var/lib/kite/music   # directory of audio files (recursive)
+    shuffle: true                 # randomize playback order
+  - playlist: /var/lib/kite/playlists/hits.m3u  # M3U playlist file
+    shuffle: false
+  - file: ./emergency.mp3         # single fallback audio file
+    title: Emergency programming  # optional title override
 ```
 
 Kite switches after `source_timeout` without valid input. It returns to a stable primary after `failback_delay`. Listener connections remain open. The switch occurs at a media frame/page boundary; Kite does not decode, crossfade, or normalize audio.
 
-Kite validates every configured fallback file during startup and before a dynamic configuration commit. A missing file or a file without a valid first frame/page rejects the complete configuration without changing disk or runtime state.
+### Extended Fallback & AutoDJ Features
 
-File fallback is looped and paced using `metadata.bitrate`, or 128 kbit/s if it is omitted.
+- **Folder & Playlist Support**: Configure `folder: path/to/dir` or `playlist: path/to/playlist.m3u`.
+- **Automatic ID3 Metadata Extraction**: When moving between tracks in a folder or playlist, Kite automatically extracts `Artist` and `Title` from ID3v2 (v2.2, v2.3, v2.4) and ID3v1 tags (or formats the filename) without external dependencies. Metadata updates are broadcast to web status listeners via SSE and inserted into ICY streaming clients at `icy_meta_interval` boundaries.
+- **Shuffle & Continuous Loop**: When `shuffle: true` is enabled, the track rotation is randomized and continuously looped with automatic reshuffle at loop boundaries.
+- **Immediate Preemption**: When a live DJ or Relay connects, fallback playback immediately stops. When the live source disconnects, fallback immediately resumes.
+
+Kite validates every configured fallback file, folder, and playlist during startup and before a dynamic configuration commit. A missing file or invalid directory rejects the configuration without changing runtime state.
+
+Fallback audio is looped and paced using `metadata.bitrate`, or 128 kbit/s if omitted.
 
 ## Buffering
 

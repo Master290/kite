@@ -101,11 +101,15 @@
             statusText = m.is_relay ? "Relay" : "Live";
           } else if (m.active_source && m.active_source !== "none" && m.active_source !== "silence") {
             badgeClass = "bg-warning text-dark";
-            statusText = m.active_source;
+            if (m.active_source.startsWith("folder:") || m.active_source.startsWith("playlist:")) {
+              statusText = "AutoDJ";
+            } else {
+              statusText = "Fallback";
+            }
           }
 
           const profile = (m.profile || "audio").toUpperCase();
-          const title = m.metadata?.title || (m.source_connected ? "Live Stream" : "Stream Offline");
+          const title = m.metadata?.title || (m.source_connected ? "Live Stream" : (statusText !== "Offline" ? "AutoDJ" : "Stream Offline"));
           const streamName = m.server_name || m.name || m.description || "";
           const m3uUrl = `/_kite/v1/playlist.m3u?mount=${encodeURIComponent(m.path)}`;
 
@@ -199,9 +203,13 @@
                 if (data.payload?.connected) {
                   badgeEl.className = "badge bg-success me-1 badge-status";
                   badgeEl.textContent = data.payload?.is_relay ? "Relay" : "Live";
-                  if (titleEl && titleEl.textContent === "Stream Offline") {
+                  if (titleEl && (titleEl.textContent === "Stream Offline" || titleEl.textContent === "AutoDJ")) {
                     titleEl.textContent = "Live Stream";
                   }
+                } else if (data.payload?.active && data.payload.active !== "silence") {
+                  badgeEl.className = "badge bg-warning text-dark me-1 badge-status";
+                  const act = data.payload.active;
+                  badgeEl.textContent = act.startsWith("folder:") || act.startsWith("playlist:") ? "AutoDJ" : "Fallback";
                 } else {
                   badgeEl.className = "badge bg-secondary me-1 badge-status";
                   badgeEl.textContent = "Offline";
