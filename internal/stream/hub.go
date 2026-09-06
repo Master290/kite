@@ -297,8 +297,15 @@ func (m *Mount) Update(cfg config.Mount, defaults config.Defaults) {
 }
 
 func (m *Mount) AcquireSource() error {
+	cfg, _ := m.settings()
+	timeout := cfg.SourceTimeout.Duration()
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+
 	m.mu.Lock()
-	if m.source && m.isRelay {
+	stale := m.source && !m.isRelay && !m.lastSource.IsZero() && time.Since(m.lastSource) > timeout
+	if (m.source && m.isRelay) || stale {
 		closer := m.sourceCloser
 		m.mu.Unlock()
 		if closer != nil {
@@ -554,6 +561,9 @@ func (m *Mount) run() {
 			healthy := connected && !last.IsZero() && time.Since(last) <= cfg.SourceTimeout.Duration()
 			if healthy {
 				continue
+			}
+			if connected && !m.isRelay && !last.IsZero() && time.Since(last) >= 2*cfg.SourceTimeout.Duration() {
+				m.DisconnectSource()
 			}
 			stableSince = time.Time{}
 			desired := m.desiredFallback(cfg)

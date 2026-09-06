@@ -62,6 +62,10 @@
           .replace(/'/g, "&#039;");
       }
 
+      function getMountId(path) {
+        return "mount_" + String(path).replace(/[^a-zA-Z0-9_-]/g, "_");
+      }
+
       function renderMounts(items) {
         if (!items || items.length === 0) {
           container.innerHTML = `
@@ -75,36 +79,48 @@
           return;
         }
 
+        // Clear initial placeholder if present
+        const placeholder = container.querySelector(".text-center.py-5");
+        if (placeholder) {
+          container.innerHTML = "";
+        }
+
         mountsCountEl.textContent = `${items.length} ${items.length === 1 ? "mount" : "mounts"}`;
         let totalListeners = 0;
 
-        container.innerHTML = items.map((m) => {
+        items.forEach((m) => {
           totalListeners += m.listeners || 0;
+          const id = getMountId(m.path);
+          let card = document.getElementById(id);
+
           let badgeClass = "bg-secondary";
           let statusText = "Offline";
 
           if (m.source_connected) {
             badgeClass = "bg-success";
             statusText = m.is_relay ? "Relay" : "Live";
-          } else if (m.active_source && m.active_source !== "none") {
+          } else if (m.active_source && m.active_source !== "none" && m.active_source !== "silence") {
             badgeClass = "bg-warning text-dark";
             statusText = m.active_source;
           }
 
           const profile = (m.profile || "audio").toUpperCase();
-          const title = m.metadata?.title || "Live Stream";
+          const title = m.metadata?.title || (m.source_connected ? "Live Stream" : "Stream Offline");
           const streamName = m.server_name || m.name || m.description || "";
           const m3uUrl = `/_kite/v1/playlist.m3u?mount=${encodeURIComponent(m.path)}`;
 
-          return `
-            <div class="card shadow-sm mb-3">
+          if (!card) {
+            const div = document.createElement("div");
+            div.id = id;
+            div.className = "card shadow-sm mb-3";
+            div.innerHTML = `
               <div class="card-header bg-white d-flex justify-content-between align-items-center py-3">
                 <div>
                   <span class="fw-bold fs-5">${escapeHtml(m.path)}</span>
-                  ${streamName ? `<span class="text-muted ms-2">${escapeHtml(streamName)}</span>` : ""}
+                  <span class="text-muted ms-2 stream-name">${escapeHtml(streamName)}</span>
                 </div>
                 <div>
-                  <span class="badge ${badgeClass} me-1" id="badge-${encodeURIComponent(m.path)}">${escapeHtml(statusText)}</span>
+                  <span class="badge ${badgeClass} me-1 badge-status">${escapeHtml(statusText)}</span>
                   <span class="badge bg-secondary">${escapeHtml(profile)}</span>
                 </div>
               </div>
@@ -112,9 +128,9 @@
                 <div class="row align-items-center">
                   <div class="col-md-6 mb-3 mb-md-0">
                     <div class="text-muted small">Now Playing:</div>
-                    <div class="fw-semibold text-truncate mb-2" id="title-${encodeURIComponent(m.path)}">${escapeHtml(title)}</div>
+                    <div class="fw-semibold text-truncate mb-2 title-text">${escapeHtml(title)}</div>
                     <div class="small text-muted">
-                      Listeners: <strong id="listeners-${encodeURIComponent(m.path)}">${m.listeners || 0}</strong>
+                      Listeners: <strong class="listeners-count">${m.listeners || 0}</strong>
                       ${m.content_type ? ` &bull; <code>${escapeHtml(m.content_type)}</code>` : ""}
                     </div>
                   </div>
@@ -127,13 +143,30 @@
                   </div>
                 </div>
               </div>
-            </div>
-          `;
-        }).join("");
+            `;
+            container.appendChild(div);
+            setupSSE(m.path);
+          } else {
+            // Update in-place to avoid stopping active audio playback
+            const badgeEl = card.querySelector(".badge-status");
+            if (badgeEl) {
+              badgeEl.className = `badge ${badgeClass} me-1 badge-status`;
+              badgeEl.textContent = statusText;
+            }
+            const titleEl = card.querySelector(".title-text");
+            if (titleEl && m.metadata?.title) {
+              titleEl.textContent = m.metadata.title;
+            } else if (titleEl && !m.source_connected && titleEl.textContent === "Live Stream") {
+              titleEl.textContent = "Stream Offline";
+            }
+            const countEl = card.querySelector(".listeners-count");
+            if (countEl) {
+              countEl.textContent = m.listeners || 0;
+            }
+          }
+        });
 
         totalListenersEl.textContent = totalListeners;
-
-        items.forEach((m) => setupSSE(m.path));
       }
 
       function setupSSE(mount) {
@@ -145,9 +178,12 @@
         es.addEventListener("metadata", (e) => {
           try {
             const data = JSON.parse(e.data);
-            const titleEl = document.getElementById(`title-${encodeURIComponent(mount)}`);
-            if (titleEl && data.payload?.title) {
-              titleEl.textContent = data.payload.title;
+            const card = document.getElementById(getMountId(mount));
+            if (card) {
+              const titleEl = card.querySelector(".title-text");
+              if (titleEl && data.payload?.title) {
+                titleEl.textContent = data.payload.title;
+              }
             }
           } catch (_) {}
         });
@@ -155,14 +191,24 @@
         es.addEventListener("source", (e) => {
           try {
             const data = JSON.parse(e.data);
-            const badgeEl = document.getElementById(`badge-${encodeURIComponent(mount)}`);
-            if (badgeEl) {
-              if (data.payload?.connected) {
-                badgeEl.className = "badge bg-success me-1";
-                badgeEl.textContent = data.payload?.is_relay ? "Relay" : "Live";
-              } else {
-                badgeEl.className = "badge bg-secondary me-1";
-                badgeEl.textContent = "Offline";
+            const card = document.getElementById(getMountId(mount));
+            if (card) {
+              const badgeEl = card.querySelector(".badge-status");
+              const titleEl = card.querySelector(".title-text");
+              if (badgeEl) {
+                if (data.payload?.connected) {
+                  badgeEl.className = "badge bg-success me-1 badge-status";
+                  badgeEl.textContent = data.payload?.is_relay ? "Relay" : "Live";
+                  if (titleEl && titleEl.textContent === "Stream Offline") {
+                    titleEl.textContent = "Live Stream";
+                  }
+                } else {
+                  badgeEl.className = "badge bg-secondary me-1 badge-status";
+                  badgeEl.textContent = "Offline";
+                  if (titleEl && titleEl.textContent === "Live Stream") {
+                    titleEl.textContent = "Stream Offline";
+                  }
+                }
               }
             }
           } catch (_) {}

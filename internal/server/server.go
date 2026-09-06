@@ -366,8 +366,17 @@ func (s *Server) handleRawSource(w http.ResponseWriter, r *http.Request, m *stre
 	if err := rw.Flush(); err != nil {
 		return
 	}
-	err = stream.Pump(m.Config().Profile, rw.Reader, m.Write)
-	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, net.ErrClosed) {
+	timeout := m.Config().SourceTimeout.Duration()
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(timeout * 2))
+	writeFn := func(b []byte) error {
+		_ = conn.SetReadDeadline(time.Now().Add(timeout * 2))
+		return m.Write(b)
+	}
+	err = stream.Pump(m.Config().Profile, rw.Reader, writeFn)
+	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, net.ErrClosed) && !os.IsTimeout(err) {
 		s.log.Warn("raw source stream ended", "mount", m.Config().Path, "error", err)
 	} else {
 		s.log.Info("source disconnected", "mount", m.Config().Path, "reason", err)
