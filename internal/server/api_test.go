@@ -166,4 +166,3 @@ func TestAdminConfigRedactsRelayPassword(t *testing.T) {
 		t.Fatalf("expected restored password, got %q", incoming.Mounts[0].Relay.Password)
 	}
 }
-

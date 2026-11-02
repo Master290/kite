@@ -17,8 +17,8 @@ const (
 	tsPIDAudio      = 0x0100
 	pesStreamAudio  = 0xC0
 	ptsTicksPerSec  = 90000
-	pcrLeadTicks    = 3600 // PCR runs 40 ms behind PTS
-	pesAudioHeader  = 14   // start code(3)+stream_id(1)+length(2)+flags(3)+PTS(5)
+	pcrLeadTicks    = 3600                 // PCR runs 40 ms behind PTS
+	pesAudioHeader  = 14                   // start code(3)+stream_id(1)+length(2)+flags(3)+PTS(5)
 	firstPayloadCap = tsPacketSize - 4 - 8 // minus TS header and AF{len,flags,PCR}
 )
 
@@ -73,7 +73,7 @@ func buildPAT() []byte {
 		0x00, 0x01, // transport_stream_id 1
 		0xC1,       // version 0, current_next_apply 1
 		0x00, 0x00, // section_number / last_section_number
-		0x00, 0x01,                                 // program_number 1
+		0x00, 0x01, // program_number 1
 		0xE0 | byte((tsPIDPMT>>8)&0x1F), byte(tsPIDPMT & 0xFF), // reserved + program_map_PID
 	}
 }
@@ -113,7 +113,7 @@ func (m *tsMuxer) psiPacket(pid uint16, cc *byte, section []byte) []byte {
 	packet[1] = 0x40 | byte(pid>>8) // payload_unit_start_indicator set
 	packet[2] = byte(pid & 0xFF)
 	packet[3] = 0x10 | m.nextCC(cc) // adaptation_field_control '01': payload only
-	packet[4] = 0x00 // pointer_field: section starts right here
+	packet[4] = 0x00                // pointer_field: section starts right here
 	n := copy(packet[5:], section)
 	for i := 5 + n; i < tsPacketSize; i++ {
 		packet[i] = 0xFF

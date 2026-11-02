@@ -23,9 +23,9 @@ import (
 	"github.com/Master290/kite/internal/web"
 	"github.com/coder/websocket"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/crypto/bcrypt"
-	"golang.org/x/net/http2"
 	"net/http/pprof"
 )
 
@@ -115,9 +115,7 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 		s.listeners = append(s.listeners, ln)
 		https := &http.Server{Handler: s.altSvc(publicMux), ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.Duration(), IdleTimeout: cfg.Server.IdleTimeout.Duration(), MaxHeaderBytes: cfg.Server.MaxHeaderBytes}
 		https.TLSConfig = s.tls.TLSConfig()
-		if err := http2.ConfigureServer(https, &http2.Server{}); err != nil {
-			return err
-		}
+		https.HTTP2 = s.http2Config()
 		s.httpsServer = https
 		s.wg.Add(1)
 		go func() {
@@ -158,7 +156,13 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 		s.packetConns = append(s.packetConns, packetConn)
 		h3Mux := http.NewServeMux()
 		s.registerPublic(h3Mux)
-		s.http3Server = &http3.Server{Handler: h3Mux, TLSConfig: s.tls.TLSConfig()}
+		s.http3Server = &http3.Server{
+			Handler:        h3Mux,
+			TLSConfig:      s.tls.TLSConfig(),
+			QUICConfig:     s.quicConfig(),
+			IdleTimeout:    cfg.Server.IdleTimeout.Duration(),
+			MaxHeaderBytes: cfg.Server.MaxHeaderBytes,
+		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -424,25 +428,25 @@ func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mou
 				need := metaInt - sent
 				if len(data) < need {
 					n, err := writer.Write(data)
+					sub.RecordWrite(n)
 					if err != nil {
 						if isDeadlineError(err) {
 							sub.Close("write_timeout")
 						}
 						return
 					}
-					sub.RecordWrite(n)
 					sent += len(data)
 					data = nil
 					continue
 				}
 				n, err := writer.Write(data[:need])
+				sub.RecordWrite(n)
 				if err != nil {
 					if isDeadlineError(err) {
 						sub.Close("write_timeout")
 					}
 					return
 				}
-				sub.RecordWrite(n)
 				data = data[need:]
 				sent = 0
 				meta = "StreamTitle='" + strings.ReplaceAll(m.Metadata().Title, "'", "\\'") + "';"
@@ -479,8 +483,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		http.Error(w, "streaming unsupported", 500)
 		return
 	}
@@ -492,7 +495,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	_ = rc.SetWriteDeadline(time.Now().Add(timeout))
-	flusher.Flush()
+	if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return
+	}
 	_ = rc.SetWriteDeadline(time.Time{})
 	for {
 		select {
@@ -956,8 +961,30 @@ func (s *Server) listenerWriteTimeout(m *stream.Mount) time.Duration {
 	return 10 * time.Second
 }
 
+func (s *Server) http2Config() *http.HTTP2Config {
+	writeTimeout := s.listenerWriteTimeout(nil)
+	return &http.HTTP2Config{
+		WriteByteTimeout: writeTimeout,
+		SendPingTimeout:  30 * time.Second,
+		PingTimeout:      15 * time.Second,
+	}
+}
+
+func (s *Server) quicConfig() *quic.Config {
+	writeTimeout := s.listenerWriteTimeout(nil)
+	idleTimeout := writeTimeout * 3
+	if cfg := s.Config(); cfg != nil && cfg.Server.IdleTimeout.Duration() > 0 {
+		idleTimeout = cfg.Server.IdleTimeout.Duration()
+	}
+	return &quic.Config{
+		Allow0RTT:       true,
+		MaxIdleTimeout:  idleTimeout,
+		KeepAlivePeriod: writeTimeout,
+	}
+}
+
 func isDeadlineError(err error) bool {
-	return err != nil && (os.IsTimeout(err) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded))
+	return err != nil && (os.IsTimeout(err) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), os.ErrDeadlineExceeded.Error()))
 }
 
 type intervalWriter struct {
@@ -983,32 +1010,43 @@ func newIntervalWriter(w http.ResponseWriter, interval, timeout time.Duration) *
 		timeout:  timeout,
 	}
 }
-func (w *intervalWriter) setWriteDeadline() {
+func (w *intervalWriter) setWriteDeadline() time.Time {
 	if w.rc != nil && w.timeout > 0 {
-		_ = w.rc.SetWriteDeadline(time.Now().Add(w.timeout))
+		deadline := time.Now().Add(w.timeout)
+		_ = w.rc.SetWriteDeadline(deadline)
+		return deadline
 	}
+	return time.Time{}
 }
 func (w *intervalWriter) clearWriteDeadline() {
 	if w.rc != nil && w.timeout > 0 {
 		_ = w.rc.SetWriteDeadline(time.Time{})
 	}
 }
+func normalizeWriteErr(err error, deadline time.Time) error {
+	if err != nil && !isDeadlineError(err) && !deadline.IsZero() && !time.Now().Before(deadline) {
+		return fmt.Errorf("%w: %w", err, os.ErrDeadlineExceeded)
+	}
+	return err
+}
 func (w *intervalWriter) Write(p []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
 	}
-	w.setWriteDeadline()
+	deadline := w.setWriteDeadline()
 	n, err := w.writer.Write(p)
 	if err != nil {
+		err = normalizeWriteErr(err, deadline)
 		w.err = err
 		return n, err
 	}
-	w.clearWriteDeadline()
 	if w.flusher != nil && (w.interval <= 0 || time.Since(w.last) >= w.interval) {
 		if err := w.Flush(); err != nil {
 			return n, err
 		}
+		return n, nil
 	}
+	w.clearWriteDeadline()
 	return n, nil
 }
 func (w *intervalWriter) Flush() error {
@@ -1018,11 +1056,12 @@ func (w *intervalWriter) Flush() error {
 	if w.flusher == nil {
 		return nil
 	}
-	w.setWriteDeadline()
+	deadline := w.setWriteDeadline()
 	if w.rc != nil {
 		err := w.rc.Flush()
 		w.last = time.Now()
 		if err != nil && !errors.Is(err, http.ErrNotSupported) {
+			err = normalizeWriteErr(err, deadline)
 			w.err = err
 			return err
 		}

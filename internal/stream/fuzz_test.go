@@ -36,7 +36,7 @@ func FuzzPumpMP3(f *testing.F) {
 	f.Add(bytes.Repeat(frame, 2))
 	f.Add([]byte("ID3\x04\x00\x00\x00\x00\x00\x00"))
 	f.Add([]byte{0xff, 0xfb, 0xf0, 0x64}) // invalid rate bits
-	f.Add([]byte{0xff, 0xe0})              // bare sync, truncated header
+	f.Add([]byte{0xff, 0xe0})             // bare sync, truncated header
 	f.Add([]byte{})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		assertPassthrough(t, "mp3", data)

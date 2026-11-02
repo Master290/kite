@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Master290/kite/internal/stream"
 )
@@ -42,6 +43,7 @@ func (s *Server) handleHLSPlaylist(w http.ResponseWriter, r *http.Request, m *st
 		}
 		fmt.Fprintf(&b, "#EXTINF:%.3f,\n%s.hls/%d.ts\n", info.Duration, m.Config().Path, info.Seq)
 	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.listenerWriteTimeout(m)))
 	_, _ = w.Write([]byte(b.String()))
 }
 
@@ -64,6 +66,7 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request, m *str
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.listenerWriteTimeout(m)))
 	_, _ = w.Write(data)
 }
 

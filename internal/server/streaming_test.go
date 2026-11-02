@@ -697,6 +697,91 @@ func TestStalledWebSocketListenerDisconnectedWithinWriteTimeout(t *testing.T) {
 	}
 }
 
+func TestStalledHTTP2ListenerDisconnectedWithinWriteTimeout(t *testing.T) {
+	writeTimeout := 100 * time.Millisecond
+	s, _ := publicServer(t, func(cfg *config.Config) {
+		cfg.Defaults.ListenerWriteTimeout = config.Duration(writeTimeout)
+		cfg.Defaults.BufferDuration = config.Duration(10 * time.Second)
+		cfg.Defaults.MaxSourceBitrate = 64_000_000
+	})
+	mux := http.NewServeMux()
+	s.registerPublic(mux)
+	ts := httptest.NewUnstartedServer(mux)
+	ts.EnableHTTP2 = true
+	ts.Config.HTTP2 = s.http2Config()
+	ts.StartTLS()
+	defer ts.Close()
+
+	client := ts.Client()
+	tr := client.Transport.(*http.Transport).Clone()
+	tr.HTTP2 = &http.HTTP2Config{
+		MaxReceiveBufferPerConnection: 64 << 10,
+		MaxReceiveBufferPerStream:     64 << 10,
+	}
+	client.Transport = tr
+
+	m, _ := s.hub.Get("/radio")
+	acquireTestSource(t, m)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/radio", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.ProtoMajor != 2 {
+		t.Fatalf("expected HTTP/2, got %s", resp.Proto)
+	}
+	waitForListeners(t, s, "/radio", 1)
+
+	initial := bytes.Repeat([]byte{0xAA}, 1024)
+	if err := m.Write(initial); err != nil {
+		t.Fatal(err)
+	}
+	_ = readBodyBytes(t, resp.Body, len(initial), 2*time.Second)
+
+	// Client stops reading from resp.Body; keep writing chunks until the HTTP/2 window fills
+	// and the write deadline fires.
+	stopPump := make(chan struct{})
+	defer close(stopPump)
+	chunk := bytes.Repeat([]byte{0xEE}, 64<<10)
+	go func() {
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPump:
+				return
+			case <-ticker.C:
+				_ = m.Write(chunk)
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(writeTimeout * 10)
+	for time.Now().Before(deadline) {
+		if m.Status().Listeners == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := m.Status().Listeners; got != 0 {
+		t.Fatalf("stalled HTTP/2 TLS listener was not removed within timeout: listeners=%d", got)
+	}
+	metrics := metricsOutput(t, s)
+	if !strings.Contains(metrics, `kite_listeners{mount="/radio",transport="http"} 0`) {
+		t.Fatalf("expected kite_listeners gauge to be 0, got:\n%s", metrics)
+	}
+	if !strings.Contains(metrics, `kite_listener_disconnects_total{mount="/radio",reason="write_timeout",transport="http"} 1`) {
+		t.Fatalf("expected write_timeout disconnect metric for HTTP/2 listener, got:\n%s", metrics)
+	}
+}
+
 func TestHealthyListenerSurvivesMultipleWriteTimeoutsAndIdleGaps(t *testing.T) {
 	writeTimeout := 50 * time.Millisecond
 	s, _ := publicServer(t, func(cfg *config.Config) {
@@ -706,6 +791,7 @@ func TestHealthyListenerSurvivesMultipleWriteTimeoutsAndIdleGaps(t *testing.T) {
 	s.registerPublic(mux)
 	ts := httptest.NewUnstartedServer(mux)
 	ts.EnableHTTP2 = true
+	ts.Config.HTTP2 = s.http2Config()
 	ts.StartTLS()
 	defer ts.Close()
 

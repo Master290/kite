@@ -33,24 +33,24 @@ type hlsSegment struct {
 }
 
 type hlsPackager struct {
-	mount     *Mount
-	muxer     *tsMuxer
-	ctx       context.Context
-	cancel    context.CancelFunc
-	lastRead  atomic.Int64
-	mu        sync.Mutex
-	segments  []hlsSegment // oldest first, bounded by hlsWindowSegments
-	nextSeq   uint64
-	cur       []byte   // in-flight segment bytes
-	samples   uint64   // accumulated samples inside cur
-	rate      int      // sample rate of frames inside cur
-	pts       uint64   // running timeline for the next frame
-	leftover  []byte   // bytes of a partial trailing frame
-	batch     []byte   // frames queued for the current PES packet
-	batchLen  int
-	batchPts  uint64
-	lastSeq   uint64
-	haveSeq   bool
+	mount       *Mount
+	muxer       *tsMuxer
+	ctx         context.Context
+	cancel      context.CancelFunc
+	lastRead    atomic.Int64
+	mu          sync.Mutex
+	segments    []hlsSegment // oldest first, bounded by hlsWindowSegments
+	nextSeq     uint64
+	cur         []byte // in-flight segment bytes
+	samples     uint64 // accumulated samples inside cur
+	rate        int    // sample rate of frames inside cur
+	pts         uint64 // running timeline for the next frame
+	leftover    []byte // bytes of a partial trailing frame
+	batch       []byte // frames queued for the current PES packet
+	batchLen    int
+	batchPts    uint64
+	lastSeq     uint64
+	haveSeq     bool
 	pendingDisc bool
 }
 
@@ -61,6 +61,7 @@ func hlsSupportedProfile(profile string) bool {
 
 // HLSSupportedProfile reports whether a mount profile can be packaged for HLS.
 func HLSSupportedProfile(profile string) bool { return hlsSupportedProfile(profile) }
+
 // ensureHLSPackager lazily starts packaging for this mount.
 func (m *Mount) ensureHLSPackager() *hlsPackager {
 	if p := m.hls.Load(); p != nil {

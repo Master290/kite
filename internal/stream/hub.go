@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -801,13 +802,13 @@ func Copy(ctx context.Context, dst io.Writer, sub subscription) error {
 			return err
 		}
 		n, err := dst.Write(chunk.Data)
+		sub.RecordWrite(n)
 		if err != nil {
-			if os.IsTimeout(err) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+			if os.IsTimeout(err) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), os.ErrDeadlineExceeded.Error()) {
 				sub.Close("write_timeout")
 			}
 			return err
 		}
-		sub.RecordWrite(n)
 	}
 }
 
