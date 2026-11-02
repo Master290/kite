@@ -49,6 +49,7 @@ type Server struct {
 	ReadHeaderTimeout    Duration `yaml:"read_header_timeout" json:"read_header_timeout"`
 	IdleTimeout          Duration `yaml:"idle_timeout" json:"idle_timeout"`
 	ShutdownTimeout      Duration `yaml:"shutdown_timeout" json:"shutdown_timeout"`
+	ListenerWriteTimeout Duration `yaml:"listener_write_timeout,omitempty" json:"listener_write_timeout,omitempty"`
 	MaxHeaderBytes       int      `yaml:"max_header_bytes" json:"max_header_bytes"`
 	HLSEnabled           *bool    `yaml:"hls_enabled,omitempty" json:"hls_enabled,omitempty"`
 	StatusPageEnabled    *bool    `yaml:"status_page_enabled,omitempty" json:"status_page_enabled,omitempty"`
@@ -81,28 +82,30 @@ type TLS struct {
 }
 
 type Defaults struct {
-	SourceTimeout    Duration `yaml:"source_timeout" json:"source_timeout"`
-	FailbackDelay    Duration `yaml:"failback_delay" json:"failback_delay"`
-	BufferDuration   Duration `yaml:"buffer_duration" json:"buffer_duration"`
-	WriteInterval    Duration `yaml:"write_interval" json:"write_interval"`
-	ICYMetaInterval  int      `yaml:"icy_meta_interval" json:"icy_meta_interval"`
-	MaxSourceBitrate int      `yaml:"max_source_bitrate" json:"max_source_bitrate"`
+	SourceTimeout        Duration `yaml:"source_timeout" json:"source_timeout"`
+	FailbackDelay        Duration `yaml:"failback_delay" json:"failback_delay"`
+	BufferDuration       Duration `yaml:"buffer_duration" json:"buffer_duration"`
+	WriteInterval        Duration `yaml:"write_interval" json:"write_interval"`
+	ListenerWriteTimeout Duration `yaml:"listener_write_timeout" json:"listener_write_timeout"`
+	ICYMetaInterval      int      `yaml:"icy_meta_interval" json:"icy_meta_interval"`
+	MaxSourceBitrate     int      `yaml:"max_source_bitrate" json:"max_source_bitrate"`
 }
 
 type Mount struct {
-	Path            string           `yaml:"path" json:"path"`
-	Hidden          bool             `yaml:"hidden,omitempty" json:"hidden,omitempty"`
-	Profile         string           `yaml:"profile" json:"profile"`
-	ContentType     string           `yaml:"content_type,omitempty" json:"content_type,omitempty"`
-	Source          SourceCredential `yaml:"source" json:"source"`
-	Relay           *RelayConfig     `yaml:"relay,omitempty" json:"relay,omitempty"`
-	Metadata        Metadata         `yaml:"metadata,omitempty" json:"metadata,omitempty"`
-	Fallback        []Fallback       `yaml:"fallback,omitempty" json:"fallback,omitempty"`
-	SourceTimeout   Duration         `yaml:"source_timeout,omitempty" json:"source_timeout,omitempty"`
-	FailbackDelay   Duration         `yaml:"failback_delay,omitempty" json:"failback_delay,omitempty"`
-	BufferDuration  Duration         `yaml:"buffer_duration,omitempty" json:"buffer_duration,omitempty"`
-	ICYMetaInterval int              `yaml:"icy_meta_interval,omitempty" json:"icy_meta_interval,omitempty"`
-	CORSOrigins     []string         `yaml:"cors_origins,omitempty" json:"cors_origins,omitempty"`
+	Path                 string           `yaml:"path" json:"path"`
+	Hidden               bool             `yaml:"hidden,omitempty" json:"hidden,omitempty"`
+	Profile              string           `yaml:"profile" json:"profile"`
+	ContentType          string           `yaml:"content_type,omitempty" json:"content_type,omitempty"`
+	Source               SourceCredential `yaml:"source" json:"source"`
+	Relay                *RelayConfig     `yaml:"relay,omitempty" json:"relay,omitempty"`
+	Metadata             Metadata         `yaml:"metadata,omitempty" json:"metadata,omitempty"`
+	Fallback             []Fallback       `yaml:"fallback,omitempty" json:"fallback,omitempty"`
+	SourceTimeout        Duration         `yaml:"source_timeout,omitempty" json:"source_timeout,omitempty"`
+	FailbackDelay        Duration         `yaml:"failback_delay,omitempty" json:"failback_delay,omitempty"`
+	BufferDuration       Duration         `yaml:"buffer_duration,omitempty" json:"buffer_duration,omitempty"`
+	ListenerWriteTimeout Duration         `yaml:"listener_write_timeout,omitempty" json:"listener_write_timeout,omitempty"`
+	ICYMetaInterval      int              `yaml:"icy_meta_interval,omitempty" json:"icy_meta_interval,omitempty"`
+	CORSOrigins          []string         `yaml:"cors_origins,omitempty" json:"cors_origins,omitempty"`
 }
 
 type RelayConfig struct {
@@ -154,12 +157,13 @@ func Default() Config {
 		Admin: Admin{Address: "127.0.0.1:9090", TokenEnv: "KITE_ADMIN_TOKEN"},
 		TLS:   TLS{Mode: "development"},
 		Defaults: Defaults{
-			SourceTimeout:    Duration(3 * time.Second),
-			FailbackDelay:    Duration(5 * time.Second),
-			BufferDuration:   Duration(2 * time.Second),
-			WriteInterval:    Duration(100 * time.Millisecond),
-			ICYMetaInterval:  16000,
-			MaxSourceBitrate: 512000,
+			SourceTimeout:        Duration(3 * time.Second),
+			FailbackDelay:        Duration(5 * time.Second),
+			BufferDuration:       Duration(2 * time.Second),
+			WriteInterval:        Duration(100 * time.Millisecond),
+			ListenerWriteTimeout: Duration(10 * time.Second),
+			ICYMetaInterval:      16000,
+			MaxSourceBitrate:     512000,
 		},
 	}
 }
@@ -233,6 +237,16 @@ func (c *Config) Normalize(baseDir string) error {
 	}
 	if c.Defaults.WriteInterval == 0 {
 		c.Defaults.WriteInterval = Duration(100 * time.Millisecond)
+	}
+	if c.Defaults.ListenerWriteTimeout == 0 {
+		if c.Server.ListenerWriteTimeout > 0 {
+			c.Defaults.ListenerWriteTimeout = c.Server.ListenerWriteTimeout
+		} else {
+			c.Defaults.ListenerWriteTimeout = Duration(10 * time.Second)
+		}
+	}
+	if c.Defaults.ListenerWriteTimeout < 0 || c.Server.ListenerWriteTimeout < 0 {
+		return errors.New("listener_write_timeout must be positive")
 	}
 	if c.Defaults.ICYMetaInterval == 0 {
 		c.Defaults.ICYMetaInterval = 16000
@@ -382,6 +396,12 @@ func normalizeMount(m *Mount, d Defaults, baseDir string) error {
 	}
 	if m.BufferDuration == 0 {
 		m.BufferDuration = d.BufferDuration
+	}
+	if m.ListenerWriteTimeout == 0 {
+		m.ListenerWriteTimeout = d.ListenerWriteTimeout
+	}
+	if m.ListenerWriteTimeout <= 0 {
+		return errors.New("listener_write_timeout must be positive")
 	}
 	if m.ICYMetaInterval == 0 {
 		m.ICYMetaInterval = d.ICYMetaInterval

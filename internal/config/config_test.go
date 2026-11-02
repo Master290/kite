@@ -35,6 +35,44 @@ mounts:
 	if m.SourceTimeout.Duration() != 3*time.Second {
 		t.Fatalf("source timeout=%s", m.SourceTimeout.Duration())
 	}
+	if m.ListenerWriteTimeout.Duration() != 10*time.Second {
+		t.Fatalf("listener write timeout=%s", m.ListenerWriteTimeout.Duration())
+	}
+}
+
+func TestParseListenerWriteTimeout(t *testing.T) {
+	t.Setenv("KITE_SOURCE_PASSWORD", "secret")
+	cfg, err := Parse([]byte(`
+version: 1
+server:
+  http_address: "127.0.0.1:8000"
+defaults:
+  listener_write_timeout: 4s
+tls:
+  mode: development
+mounts:
+  - path: /radio
+    profile: mp3
+    source:
+      password_env: KITE_SOURCE_PASSWORD
+  - path: /fast
+    profile: mp3
+    listener_write_timeout: 1500ms
+    source:
+      password_env: KITE_SOURCE_PASSWORD
+`), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Defaults.ListenerWriteTimeout.Duration() != 4*time.Second {
+		t.Fatalf("defaults listener_write_timeout=%s", cfg.Defaults.ListenerWriteTimeout.Duration())
+	}
+	if cfg.Mounts[0].ListenerWriteTimeout.Duration() != 4*time.Second {
+		t.Fatalf("mount[0] listener_write_timeout=%s", cfg.Mounts[0].ListenerWriteTimeout.Duration())
+	}
+	if cfg.Mounts[1].ListenerWriteTimeout.Duration() != 1500*time.Millisecond {
+		t.Fatalf("mount[1] listener_write_timeout=%s", cfg.Mounts[1].ListenerWriteTimeout.Duration())
+	}
 }
 
 func TestParseRejectsFallbackCycle(t *testing.T) {
@@ -196,5 +234,3 @@ mounts:
 		t.Fatal("expected error when both file and folder specified")
 	}
 }
-
-

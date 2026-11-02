@@ -444,7 +444,11 @@ func bufferBytes(cfg config.Mount, defaults config.Defaults) int {
 	if bitrate <= 0 {
 		bitrate = defaults.MaxSourceBitrate
 	}
-	bytes := int(float64(bitrate) / 8 * cfg.BufferDuration.Duration().Seconds())
+	dur := cfg.BufferDuration.Duration()
+	if dur <= 0 {
+		dur = defaults.BufferDuration.Duration()
+	}
+	bytes := int(float64(bitrate) / 8 * dur.Seconds())
 	if bytes < 16<<10 {
 		bytes = 16 << 10
 	}
@@ -797,10 +801,13 @@ func Copy(ctx context.Context, dst io.Writer, sub subscription) error {
 			return err
 		}
 		n, err := dst.Write(chunk.Data)
-		sub.RecordWrite(n)
 		if err != nil {
+			if os.IsTimeout(err) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+				sub.Close("write_timeout")
+			}
 			return err
 		}
+		sub.RecordWrite(n)
 	}
 }
 

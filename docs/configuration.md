@@ -94,6 +94,8 @@ Fallback audio is looped and paced using `metadata.bitrate`, or 128 kbit/s if om
 
 `buffer_duration` determines the bounded per-listener queue. A client that falls beyond the live window is disconnected instead of increasing latency and memory indefinitely. Tune `metadata.bitrate` accurately to make this bound representative.
 
+`listener_write_timeout` (default `10s`) bounds each write or flush to an HTTP or WebSocket listener so stalled clients that stop reading are disconnected promptly.
+
 ## CORS
 
 List allowed browser origins per mount. `"*"` is suitable only for public streams. WebSocket requests are rejected when their `Origin` is not allowed.

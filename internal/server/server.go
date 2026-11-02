@@ -259,7 +259,9 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 
 // registerPprof attaches Go runtime profiling handlers behind the admin token.
 func registerPprof(mux *http.ServeMux, auth func(http.HandlerFunc) http.HandlerFunc) {
-	authed := func(h http.HandlerFunc) http.HandlerFunc { return auth(func(w http.ResponseWriter, r *http.Request) { h(w, r) }) }
+	authed := func(h http.HandlerFunc) http.HandlerFunc {
+		return auth(func(w http.ResponseWriter, r *http.Request) { h(w, r) })
+	}
 	mux.HandleFunc("/debug/pprof/", authed(pprof.Index))
 	mux.HandleFunc("/debug/pprof/cmdline", authed(pprof.Cmdline))
 	mux.HandleFunc("/debug/pprof/profile", authed(pprof.Profile))
@@ -310,8 +312,17 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sub := m.Subscribe("http")
-	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration())
+	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration(), s.listenerWriteTimeout(m))
 	defer writer.Flush()
+	if err := writer.Flush(); err != nil {
+		if isDeadlineError(err) {
+			sub.Close("write_timeout")
+		} else {
+			sub.Close("client_closed")
+		}
+		return
+	}
+	writer.last = time.Time{}
 	_ = stream.Copy(r.Context(), writer, sub)
 }
 
@@ -386,13 +397,17 @@ func (s *Server) handleRawSource(w http.ResponseWriter, r *http.Request, m *stre
 func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mount) {
 	metaInt := m.Config().ICYMetaInterval
 	w.Header().Set("icy-metaint", strconv.Itoa(metaInt))
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
 	sub := m.Subscribe("http-icy")
 	defer sub.Close("client_closed")
-	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration())
+	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration(), s.listenerWriteTimeout(m))
 	defer writer.Flush()
+	if err := writer.Flush(); err != nil {
+		if isDeadlineError(err) {
+			sub.Close("write_timeout")
+		}
+		return
+	}
+	writer.last = time.Time{}
 	meta := ""
 	sent := 0
 	for {
@@ -409,19 +424,25 @@ func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mou
 				need := metaInt - sent
 				if len(data) < need {
 					n, err := writer.Write(data)
-					sub.RecordWrite(n)
 					if err != nil {
+						if isDeadlineError(err) {
+							sub.Close("write_timeout")
+						}
 						return
 					}
+					sub.RecordWrite(n)
 					sent += len(data)
 					data = nil
 					continue
 				}
 				n, err := writer.Write(data[:need])
-				sub.RecordWrite(n)
 				if err != nil {
+					if isDeadlineError(err) {
+						sub.Close("write_timeout")
+					}
 					return
 				}
+				sub.RecordWrite(n)
 				data = data[need:]
 				sent = 0
 				meta = "StreamTitle='" + strings.ReplaceAll(m.Metadata().Title, "'", "\\'") + "';"
@@ -432,9 +453,17 @@ func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mou
 				padded := append([]byte(meta), make([]byte, int(block[0])*16-len(meta))...)
 				block = append(block, padded...)
 				if _, err := writer.Write(block); err != nil {
+					if isDeadlineError(err) {
+						sub.Close("write_timeout")
+					}
 					return
 				}
-				writer.Flush()
+				if err := writer.Flush(); err != nil {
+					if isDeadlineError(err) {
+						sub.Close("write_timeout")
+					}
+					return
+				}
 			}
 		}
 	}
@@ -455,12 +484,16 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unsupported", 500)
 		return
 	}
+	rc := http.NewResponseController(w)
+	timeout := s.listenerWriteTimeout(m)
 	lastID, _ := strconv.ParseUint(r.Header.Get("Last-Event-ID"), 10, 64)
 	ch, cancel := m.SubscribeEvents(lastID)
 	defer cancel()
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+	_ = rc.SetWriteDeadline(time.Now().Add(timeout))
 	flusher.Flush()
+	_ = rc.SetWriteDeadline(time.Time{})
 	for {
 		select {
 		case <-r.Context().Done():
@@ -470,11 +503,25 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			b, _ := json.Marshal(ev)
-			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", ev.ID, ev.Type, b)
-			flusher.Flush()
+			_ = rc.SetWriteDeadline(time.Now().Add(timeout))
+			if _, err := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", ev.ID, ev.Type, b); err != nil {
+				return
+			}
+			_ = rc.SetWriteDeadline(time.Now().Add(timeout))
+			if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+				return
+			}
+			_ = rc.SetWriteDeadline(time.Time{})
 		case <-ticker.C:
-			fmt.Fprint(w, ": heartbeat\n\n")
-			flusher.Flush()
+			_ = rc.SetWriteDeadline(time.Now().Add(timeout))
+			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			_ = rc.SetWriteDeadline(time.Now().Add(timeout))
+			if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+				return
+			}
+			_ = rc.SetWriteDeadline(time.Time{})
 		}
 	}
 }
@@ -494,14 +541,29 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	defer c.Close(websocket.StatusNormalClosure, "")
-	ctx := r.Context()
+	defer c.CloseNow()
+	ctx, wsCancel := context.WithCancel(r.Context())
+	defer wsCancel()
 	sub := m.Subscribe("websocket")
 	defer sub.Close("client_closed")
 	events, cancel := m.SubscribeEvents(0)
 	defer cancel()
+	writeWS := func(typ websocket.MessageType, data []byte) error {
+		writeCtx, cancelWrite := context.WithTimeout(ctx, s.listenerWriteTimeout(m))
+		defer cancelWrite()
+		err := c.Write(writeCtx, typ, data)
+		if err != nil {
+			if isDeadlineError(err) {
+				sub.Close("write_timeout")
+			}
+			_ = c.CloseNow()
+		}
+		return err
+	}
 	hello, _ := json.Marshal(map[string]any{"type": "hello", "mount": m.Config().Path, "profile": m.Config().Profile, "content_type": m.Config().ContentType})
-	_ = c.Write(ctx, websocket.MessageText, hello)
+	if err := writeWS(websocket.MessageText, hello); err != nil {
+		return
+	}
 	type audioResult struct {
 		chunk stream.Chunk
 		err   error
@@ -529,17 +591,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			b, _ := json.Marshal(ev)
-			if err := c.Write(ctx, websocket.MessageText, b); err != nil {
+			if err := writeWS(websocket.MessageText, b); err != nil {
 				return
 			}
 		case result := <-audio:
 			if result.err != nil {
 				if errors.Is(result.err, stream.ErrSlowListener) {
+					timer := time.AfterFunc(s.listenerWriteTimeout(m), func() { _ = c.CloseNow() })
 					_ = c.Close(websocket.StatusTryAgainLater, "listener fell behind")
+					timer.Stop()
 				}
 				return
 			}
-			if err := c.Write(ctx, websocket.MessageBinary, result.chunk.Data); err != nil {
+			if err := writeWS(websocket.MessageBinary, result.chunk.Data); err != nil {
 				return
 			}
 			sub.RecordWrite(len(result.chunk.Data))
@@ -875,30 +939,100 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func (s *Server) listenerWriteTimeout(m *stream.Mount) time.Duration {
+	if m != nil {
+		if d := m.Config().ListenerWriteTimeout.Duration(); d > 0 {
+			return d
+		}
+	}
+	if cfg := s.Config(); cfg != nil {
+		if d := cfg.Defaults.ListenerWriteTimeout.Duration(); d > 0 {
+			return d
+		}
+		if d := cfg.Server.ListenerWriteTimeout.Duration(); d > 0 {
+			return d
+		}
+	}
+	return 10 * time.Second
+}
+
+func isDeadlineError(err error) bool {
+	return err != nil && (os.IsTimeout(err) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded))
+}
+
 type intervalWriter struct {
 	writer   io.Writer
 	flusher  http.Flusher
+	rc       *http.ResponseController
 	interval time.Duration
+	timeout  time.Duration
 	last     time.Time
+	err      error
 }
 
-func newIntervalWriter(w http.ResponseWriter, interval time.Duration) *intervalWriter {
+func newIntervalWriter(w http.ResponseWriter, interval, timeout time.Duration) *intervalWriter {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
 	flusher, _ := w.(http.Flusher)
-	return &intervalWriter{writer: w, flusher: flusher, interval: interval, last: time.Now()}
+	return &intervalWriter{
+		writer:   w,
+		flusher:  flusher,
+		rc:       http.NewResponseController(w),
+		interval: interval,
+		timeout:  timeout,
+	}
+}
+func (w *intervalWriter) setWriteDeadline() {
+	if w.rc != nil && w.timeout > 0 {
+		_ = w.rc.SetWriteDeadline(time.Now().Add(w.timeout))
+	}
+}
+func (w *intervalWriter) clearWriteDeadline() {
+	if w.rc != nil && w.timeout > 0 {
+		_ = w.rc.SetWriteDeadline(time.Time{})
+	}
 }
 func (w *intervalWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	w.setWriteDeadline()
 	n, err := w.writer.Write(p)
+	if err != nil {
+		w.err = err
+		return n, err
+	}
+	w.clearWriteDeadline()
 	if w.flusher != nil && (w.interval <= 0 || time.Since(w.last) >= w.interval) {
-		w.flusher.Flush()
-		w.last = time.Now()
+		if err := w.Flush(); err != nil {
+			return n, err
+		}
 	}
-	return n, err
+	return n, nil
 }
-func (w *intervalWriter) Flush() {
-	if w.flusher != nil {
-		w.flusher.Flush()
-		w.last = time.Now()
+func (w *intervalWriter) Flush() error {
+	if w.err != nil {
+		return w.err
 	}
+	if w.flusher == nil {
+		return nil
+	}
+	w.setWriteDeadline()
+	if w.rc != nil {
+		err := w.rc.Flush()
+		w.last = time.Now()
+		if err != nil && !errors.Is(err, http.ErrNotSupported) {
+			w.err = err
+			return err
+		}
+		w.clearWriteDeadline()
+		return nil
+	}
+	w.flusher.Flush()
+	w.clearWriteDeadline()
+	w.last = time.Now()
+	return nil
 }
 
 func BasicAuthHeader(user, password string) string {

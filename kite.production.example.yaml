@@ -26,6 +26,7 @@ defaults:
   failback_delay: 5s
   buffer_duration: 2s
   write_interval: 100ms
+  listener_write_timeout: 10s
   icy_meta_interval: 16000
   max_source_bitrate: 512000
 

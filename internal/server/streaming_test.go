@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -494,5 +495,353 @@ func TestAdminMetadataRequiresAuthAndUpdatesMount(t *testing.T) {
 	m, _ := s.hub.Get("/radio")
 	if got := m.Metadata(); got.Title != "Artist - Title" {
 		t.Fatalf("hub metadata=%+v", got)
+	}
+}
+
+func metricsOutput(t *testing.T, s *Server) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	s.registerAdmin(mux)
+	req := httptest.NewRequest(http.MethodGet, "http://admin/metrics", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status=%d", rec.Code)
+	}
+	return rec.Body.String()
+}
+
+func TestStalledHTTPListenerDisconnectedWithinWriteTimeout(t *testing.T) {
+	writeTimeout := 100 * time.Millisecond
+	s, ts := publicServer(t, func(cfg *config.Config) {
+		cfg.Defaults.ListenerWriteTimeout = config.Duration(writeTimeout)
+		cfg.Defaults.BufferDuration = config.Duration(10 * time.Second)
+		cfg.Defaults.MaxSourceBitrate = 64_000_000
+	})
+	m, _ := s.hub.Get("/radio")
+	acquireTestSource(t, m)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/radio", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	waitForListeners(t, s, "/radio", 1)
+
+	initial := bytes.Repeat([]byte{0xAA}, 1024)
+	if err := m.Write(initial); err != nil {
+		t.Fatal(err)
+	}
+	_ = readBodyBytes(t, resp.Body, len(initial), 2*time.Second)
+
+	// Client stops reading from resp.Body; keep writing chunks until the socket buffer fills
+	// and the write deadline fires.
+	stopPump := make(chan struct{})
+	defer close(stopPump)
+	chunk := bytes.Repeat([]byte{0xBB}, 64<<10)
+	go func() {
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPump:
+				return
+			case <-ticker.C:
+				_ = m.Write(chunk)
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(writeTimeout * 10)
+	for time.Now().Before(deadline) {
+		if m.Status().Listeners == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := m.Status().Listeners; got != 0 {
+		t.Fatalf("stalled HTTP listener was not removed within timeout: listeners=%d", got)
+	}
+	metrics := metricsOutput(t, s)
+	if !strings.Contains(metrics, `kite_listeners{mount="/radio",transport="http"} 0`) {
+		t.Fatalf("expected kite_listeners gauge to be 0, got:\n%s", metrics)
+	}
+	if !strings.Contains(metrics, `kite_listener_disconnects_total{mount="/radio",reason="write_timeout",transport="http"} 1`) {
+		t.Fatalf("expected write_timeout disconnect metric, got:\n%s", metrics)
+	}
+}
+
+func TestStalledICYListenerDisconnectedWithinWriteTimeout(t *testing.T) {
+	writeTimeout := 100 * time.Millisecond
+	s, ts := publicServer(t, func(cfg *config.Config) {
+		cfg.Defaults.ListenerWriteTimeout = config.Duration(writeTimeout)
+		cfg.Defaults.BufferDuration = config.Duration(10 * time.Second)
+		cfg.Defaults.MaxSourceBitrate = 64_000_000
+		cfg.Mounts[0].ICYMetaInterval = 16000
+	})
+	m, _ := s.hub.Get("/radio")
+	acquireTestSource(t, m)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/radio", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Icy-MetaData", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	waitForListeners(t, s, "/radio", 1)
+
+	stopPump := make(chan struct{})
+	defer close(stopPump)
+	chunk := bytes.Repeat([]byte{0xDD}, 64<<10)
+	go func() {
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPump:
+				return
+			case <-ticker.C:
+				_ = m.Write(chunk)
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(writeTimeout * 10)
+	for time.Now().Before(deadline) {
+		if m.Status().Listeners == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := m.Status().Listeners; got != 0 {
+		t.Fatalf("stalled ICY listener was not removed within timeout: listeners=%d", got)
+	}
+	metrics := metricsOutput(t, s)
+	if !strings.Contains(metrics, `kite_listeners{mount="/radio",transport="http-icy"} 0`) {
+		t.Fatalf("expected kite_listeners http-icy gauge to be 0, got:\n%s", metrics)
+	}
+	if !strings.Contains(metrics, `kite_listener_disconnects_total{mount="/radio",reason="write_timeout",transport="http-icy"} 1`) {
+		t.Fatalf("expected http-icy write_timeout disconnect metric, got:\n%s", metrics)
+	}
+}
+
+func TestStalledWebSocketListenerDisconnectedWithinWriteTimeout(t *testing.T) {
+	writeTimeout := 100 * time.Millisecond
+	s, ts := publicServer(t, func(cfg *config.Config) {
+		cfg.Defaults.ListenerWriteTimeout = config.Duration(writeTimeout)
+		cfg.Defaults.BufferDuration = config.Duration(10 * time.Second)
+		cfg.Defaults.MaxSourceBitrate = 64_000_000
+	})
+	m, _ := s.hub.Get("/radio")
+	acquireTestSource(t, m)
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/_kite/v1/ws?mount=/radio"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.CloseNow()
+
+	// Read hello message, then stop reading from the WebSocket connection.
+	if _, _, err := c.Read(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForListeners(t, s, "/radio", 1)
+
+	stopPump := make(chan struct{})
+	defer close(stopPump)
+	chunk := bytes.Repeat([]byte{0xCC}, 64<<10)
+	go func() {
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPump:
+				return
+			case <-ticker.C:
+				_ = m.Write(chunk)
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(writeTimeout * 10)
+	for time.Now().Before(deadline) {
+		if m.Status().Listeners == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := m.Status().Listeners; got != 0 {
+		t.Fatalf("stalled WebSocket listener was not removed within timeout: listeners=%d", got)
+	}
+	metrics := metricsOutput(t, s)
+	if !strings.Contains(metrics, `kite_listeners{mount="/radio",transport="websocket"} 0`) {
+		t.Fatalf("expected kite_listeners websocket gauge to be 0, got:\n%s", metrics)
+	}
+	if !strings.Contains(metrics, `kite_listener_disconnects_total{mount="/radio",reason="write_timeout",transport="websocket"} 1`) {
+		t.Fatalf("expected websocket write_timeout disconnect metric, got:\n%s", metrics)
+	}
+}
+
+func TestHealthyListenerSurvivesMultipleWriteTimeoutsAndIdleGaps(t *testing.T) {
+	writeTimeout := 50 * time.Millisecond
+	s, _ := publicServer(t, func(cfg *config.Config) {
+		cfg.Defaults.ListenerWriteTimeout = config.Duration(writeTimeout)
+	})
+	mux := http.NewServeMux()
+	s.registerPublic(mux)
+	ts := httptest.NewUnstartedServer(mux)
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	defer ts.Close()
+
+	m, _ := s.hub.Get("/radio")
+	acquireTestSource(t, m)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/radio", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	waitForListeners(t, s, "/radio", 1)
+
+	chunk := []byte("healthy-audio-frame")
+	for i := 0; i < 4; i++ {
+		if err := m.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		got := readBodyBytes(t, resp.Body, len(chunk), time.Second)
+		if !bytes.Equal(got, chunk) {
+			t.Fatalf("chunk %d=%q", i, got)
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	// Pause longer than 2x writeTimeout (120ms > 50ms) and verify the listener is not dropped.
+	time.Sleep(120 * time.Millisecond)
+	if err := m.Write(chunk); err != nil {
+		t.Fatal(err)
+	}
+	got := readBodyBytes(t, resp.Body, len(chunk), time.Second)
+	if !bytes.Equal(got, chunk) {
+		t.Fatalf("post-idle chunk=%q", got)
+	}
+	if m.Status().Listeners != 1 {
+		t.Fatalf("healthy listener dropped: listeners=%d", m.Status().Listeners)
+	}
+}
+
+type noDeadlineResponseWriter struct {
+	header  http.Header
+	written bytes.Buffer
+	flushed int
+}
+
+func (w *noDeadlineResponseWriter) Header() http.Header         { return w.header }
+func (w *noDeadlineResponseWriter) WriteHeader(int)             {}
+func (w *noDeadlineResponseWriter) Write(p []byte) (int, error) { return w.written.Write(p) }
+func (w *noDeadlineResponseWriter) Flush()                      { w.flushed++ }
+
+func TestListenerIgnoresErrNotSupportedFromSetWriteDeadline(t *testing.T) {
+	rw := &noDeadlineResponseWriter{header: make(http.Header)}
+	rc := http.NewResponseController(rw)
+	if err := rc.SetWriteDeadline(time.Now().Add(time.Second)); err == nil {
+		t.Fatal("expected SetWriteDeadline to return ErrNotSupported on noDeadlineResponseWriter")
+	}
+
+	iw := newIntervalWriter(rw, 0, 50*time.Millisecond)
+	payload := []byte("transport-without-deadline")
+	n, err := iw.Write(payload)
+	if err != nil {
+		t.Fatalf("unexpected error when SetWriteDeadline is unsupported: %v", err)
+	}
+	if n != len(payload) || !bytes.Equal(rw.written.Bytes(), payload) {
+		t.Fatalf("written=%q", rw.written.Bytes())
+	}
+	if rw.flushed == 0 {
+		t.Fatal("expected Flush to be called")
+	}
+}
+
+type failingDeadlineWriter struct {
+	header  http.Header
+	once    sync.Once
+	entered chan struct{}
+	block   chan struct{}
+}
+
+func (w *failingDeadlineWriter) Header() http.Header { return w.header }
+func (w *failingDeadlineWriter) WriteHeader(int)     {}
+func (w *failingDeadlineWriter) Write(p []byte) (int, error) {
+	if w.entered != nil {
+		w.once.Do(func() { close(w.entered) })
+	}
+	if w.block != nil {
+		<-w.block
+	}
+	return 0, context.DeadlineExceeded
+}
+func (w *failingDeadlineWriter) Flush() {}
+
+func TestListenerCounterDecrementedOnceOnConcurrentTimeoutAndDisconnect(t *testing.T) {
+	s, _ := publicServer(t, func(cfg *config.Config) {
+		cfg.Defaults.ListenerWriteTimeout = config.Duration(50 * time.Millisecond)
+	})
+	m, _ := s.hub.Get("/radio")
+	acquireTestSource(t, m)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "http://radio.example/radio", nil).WithContext(ctx)
+	rw := &failingDeadlineWriter{header: make(http.Header), entered: make(chan struct{}), block: make(chan struct{})}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.handleListener(rw, req)
+	}()
+
+	waitForListeners(t, s, "/radio", 1)
+	if err := m.Write([]byte("trigger-write")); err != nil {
+		t.Fatal(err)
+	}
+	<-rw.entered
+
+	// Trigger write deadline failure and client context cancellation simultaneously.
+	close(rw.block)
+	cancel()
+	<-done
+
+	if got := m.Status().Listeners; got != 0 {
+		t.Fatalf("listeners=%d, want 0", got)
+	}
+	metrics := metricsOutput(t, s)
+	if !strings.Contains(metrics, `kite_listeners{mount="/radio",transport="http"} 0`) {
+		t.Fatalf("expected kite_listeners gauge to be 0, got:\n%s", metrics)
+	}
+	if !strings.Contains(metrics, `kite_listener_disconnects_total{mount="/radio",reason="write_timeout",transport="http"} 1`) {
+		t.Fatalf("expected exactly 1 write_timeout disconnect, got:\n%s", metrics)
+	}
+	if strings.Contains(metrics, `kite_listener_disconnects_total{mount="/radio",reason="client_closed",transport="http"}`) {
+		t.Fatalf("unexpected double disconnect in metrics:\n%s", metrics)
 	}
 }
