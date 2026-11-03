@@ -47,6 +47,7 @@ mounts:
       username: relay_user        # optional
       password_env: RELAY_PASS    # or password, or password_file
       retry_delay: 3s             # default: 3s
+      relay_idle_timeout: 10s     # default: 10s (disconnect & reconnect if upstream goes silent)
 ```
 
 Kite requests ICY metadata (`Icy-MetaData: 1`) from the upstream server, extracts `StreamTitle` metadata updates on the fly without audio artifacts, and distributes the clean audio frames to local listeners.

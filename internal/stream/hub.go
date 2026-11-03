@@ -128,6 +128,10 @@ type subscription struct {
 
 func (s subscription) Close(reason string) { s.mount.removeListener(s.id, reason) }
 
+func isInternalTransport(transport string) bool {
+	return transport == "fallback" || transport == "relay"
+}
+
 func (s subscription) Next(ctx context.Context) (Chunk, error) {
 	path := s.mount.Config().Path
 	for {
@@ -146,7 +150,9 @@ func (s subscription) Next(ctx context.Context) (Chunk, error) {
 		if len(s.mount.ring) > 0 && listener.cursor < s.mount.ringFirst {
 			delete(s.mount.listeners, s.id)
 			s.mount.mu.Unlock()
-			s.mount.observer.ListenerClosed(path, listener.transport, "slow")
+			if !isInternalTransport(listener.transport) {
+				s.mount.observer.ListenerClosed(path, listener.transport, "slow")
+			}
 			return Chunk{}, ErrSlowListener
 		}
 		if len(s.mount.ring) > 0 && listener.cursor >= s.mount.ringFirst && listener.cursor <= s.mount.sequence {
@@ -169,7 +175,7 @@ func (s subscription) Next(ctx context.Context) (Chunk, error) {
 }
 
 func (s subscription) RecordWrite(n int) {
-	if n <= 0 || s.transport == "fallback" {
+	if n <= 0 || isInternalTransport(s.transport) {
 		return
 	}
 	s.mount.mu.Lock()
@@ -282,7 +288,22 @@ func (m *Mount) settings() (config.Mount, config.Defaults) {
 	defer m.cfgMu.RUnlock()
 	return m.cfg, m.defaults
 }
+func (m *Mount) relayIdleTimeout() time.Duration {
+	cfg, defaults := m.settings()
+	if cfg.Relay != nil && cfg.Relay.RelayIdleTimeout.Duration() > 0 {
+		return cfg.Relay.RelayIdleTimeout.Duration()
+	}
+	if cfg.RelayIdleTimeout.Duration() > 0 {
+		return cfg.RelayIdleTimeout.Duration()
+	}
+	if defaults.RelayIdleTimeout.Duration() > 0 {
+		return defaults.RelayIdleTimeout.Duration()
+	}
+	return 10 * time.Second
+}
+
 func (m *Mount) Update(cfg config.Mount, defaults config.Defaults) {
+	oldIdle := m.relayIdleTimeout()
 	m.cfgMu.Lock()
 	oldRelay := m.cfg.Relay
 	m.cfg = cfg
@@ -290,7 +311,7 @@ func (m *Mount) Update(cfg config.Mount, defaults config.Defaults) {
 	m.cfgMu.Unlock()
 
 	if cfg.Relay != nil {
-		if oldRelay == nil || *oldRelay != *cfg.Relay {
+		if oldRelay == nil || *oldRelay != *cfg.Relay || oldIdle != m.relayIdleTimeout() {
 			m.startRelay(*cfg.Relay)
 		}
 	} else if oldRelay != nil {
@@ -437,7 +458,9 @@ func (m *Mount) Subscribe(transport string) subscription {
 	l := &listener{cursor: m.sequence + 1, transport: transport, prelude: prelude}
 	m.listeners[id] = l
 	m.mu.Unlock()
-	m.observer.ListenerOpened(m.Config().Path, transport)
+	if !isInternalTransport(transport) {
+		m.observer.ListenerOpened(m.Config().Path, transport)
+	}
 	return subscription{mount: m, id: id, transport: transport}
 }
 
@@ -467,7 +490,7 @@ func (m *Mount) removeListener(id uint64, reason string) {
 		delete(m.listeners, id)
 	}
 	m.mu.Unlock()
-	if ok {
+	if ok && !isInternalTransport(listener.transport) {
 		m.observer.ListenerClosed(m.Config().Path, listener.transport, reason)
 	}
 }
@@ -562,13 +585,17 @@ func (m *Mount) run() {
 		case <-ticker.C:
 			cfg := m.Config()
 			m.mu.RLock()
-			connected, last, active := m.source, m.lastSource, m.active
+			connected, isRelay, last, active := m.source, m.isRelay, m.lastSource, m.active
 			m.mu.RUnlock()
 			healthy := connected && !last.IsZero() && time.Since(last) <= cfg.SourceTimeout.Duration()
 			if healthy {
 				continue
 			}
-			if connected && !m.isRelay && !last.IsZero() && time.Since(last) >= 2*cfg.SourceTimeout.Duration() {
+			staleTimeout := 2 * cfg.SourceTimeout.Duration()
+			if isRelay {
+				staleTimeout = m.relayIdleTimeout()
+			}
+			if connected && !last.IsZero() && staleTimeout > 0 && time.Since(last) >= staleTimeout {
 				m.DisconnectSource()
 			}
 			stableSince = time.Time{}
@@ -778,7 +805,9 @@ func (m *Mount) closeListeners(reason string) {
 	close(oldNotify)
 	m.mu.Unlock()
 	for _, transport := range transports {
-		m.observer.ListenerClosed(path, transport, reason)
+		if !isInternalTransport(transport) {
+			m.observer.ListenerClosed(path, transport, reason)
+		}
 	}
 }
 
@@ -788,7 +817,7 @@ func (m *Mount) Status() Status {
 	defer m.mu.RUnlock()
 	listeners := 0
 	for _, l := range m.listeners {
-		if l.transport != "fallback" {
+		if !isInternalTransport(l.transport) {
 			listeners++
 		}
 	}

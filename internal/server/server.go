@@ -401,7 +401,11 @@ func (s *Server) handleRawSource(w http.ResponseWriter, r *http.Request, m *stre
 func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mount) {
 	metaInt := m.Config().ICYMetaInterval
 	w.Header().Set("icy-metaint", strconv.Itoa(metaInt))
-	sub := m.Subscribe("http-icy")
+	transport := "http-icy"
+	if isRelaySubscriber(r) {
+		transport = "relay"
+	}
+	sub := m.Subscribe(transport)
 	defer sub.Close("client_closed")
 	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration(), s.listenerWriteTimeout(m))
 	defer writer.Flush()
@@ -944,7 +948,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func isRelaySubscriber(r *http.Request) bool {
+	return strings.HasPrefix(r.Header.Get("User-Agent"), "Kite/1.0 (Relay)")
+}
+
 func listenerTransport(r *http.Request) string {
+	if isRelaySubscriber(r) {
+		return "relay"
+	}
 	switch r.ProtoMajor {
 	case 2:
 		return "http2"

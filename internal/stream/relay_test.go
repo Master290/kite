@@ -353,3 +353,119 @@ func TestRelayWorkerDirectDJPriority(t *testing.T) {
 		}
 	}
 }
+
+func TestRelayWorkerSilentUpstreamReconnectsWithinIdleTimeout(t *testing.T) {
+	var attempts atomic.Int32
+	stalledSince := make(chan time.Time, 1)
+	reconnectedAt := make(chan time.Time, 1)
+	frame := makeTestMP3Frame()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := attempts.Add(1)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+
+		if attempt == 1 {
+			for i := 0; i < 4; i++ {
+				if _, err := w.Write(frame); err != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			select {
+			case stalledSince <- time.Now():
+			default:
+			}
+			// Stop sending without closing the connection; wait for relay to close it.
+			<-r.Context().Done()
+			return
+		}
+
+		select {
+		case reconnectedAt <- time.Now():
+		default:
+		}
+		for {
+			if _, err := w.Write(frame); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(15 * time.Millisecond):
+			}
+		}
+	}))
+	defer server.Close()
+
+	idleTimeout := 150 * time.Millisecond
+	mountCfg := config.Mount{
+		Path:             "/silent-relay",
+		Profile:          "mp3",
+		ContentType:      "audio/mpeg",
+		SourceTimeout:    config.Duration(250 * time.Millisecond),
+		BufferDuration:   config.Duration(250 * time.Millisecond),
+		RelayIdleTimeout: config.Duration(idleTimeout),
+		Relay: &config.RelayConfig{
+			URL:              server.URL,
+			RetryDelay:       config.Duration(30 * time.Millisecond),
+			RelayIdleTimeout: config.Duration(idleTimeout),
+		},
+	}
+
+	h, err := NewHub(testConfig(mountCfg), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	var stallStart time.Time
+	select {
+	case stallStart = <-stalledSince:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for initial relay connection to stall")
+	}
+
+	select {
+	case reconn := <-reconnectedAt:
+		elapsed := reconn.Sub(stallStart)
+		if elapsed > 600*time.Millisecond {
+			t.Fatalf("expected reconnect shortly after %v idle timeout, took %v", idleTimeout, elapsed)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("relay did not reconnect after upstream went silent (attempts=%d)", attempts.Load())
+	}
+}
+
+func TestRelayInternalSubscriberExcludedFromPublicListeners(t *testing.T) {
+	h, err := NewHub(testConfig(testMount("/radio")), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	m, ok := h.Get("/radio")
+	if !ok {
+		t.Fatal("mount not found")
+	}
+
+	relaySub := m.Subscribe("relay")
+	defer relaySub.Close("done")
+
+	if got := m.Status().Listeners; got != 0 {
+		t.Fatalf("expected internal relay subscriber to be excluded from public listener count, got %d", got)
+	}
+
+	publicSub := m.Subscribe("http")
+	defer publicSub.Close("done")
+
+	if got := m.Status().Listeners; got != 1 {
+		t.Fatalf("expected 1 public listener, got %d", got)
+	}
+}

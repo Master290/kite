@@ -83,29 +83,66 @@ func ParseICYMetadata(raw []byte) (title string, url string) {
 	}
 	s := string(raw)
 	for len(s) > 0 {
-		idx := strings.IndexByte(s, ';')
-		var part string
-		if idx >= 0 {
-			part = s[:idx]
-			s = s[idx+1:]
-		} else {
-			part = s
-			s = ""
+		s = strings.TrimLeft(s, " \t\r\n;")
+		if len(s) == 0 {
+			break
 		}
-		part = strings.TrimSpace(part)
-		if eq := strings.IndexByte(part, '='); eq > 0 {
-			key := strings.TrimSpace(part[:eq])
-			val := strings.TrimSpace(part[eq+1:])
-			if len(val) >= 2 && ((val[0] == '\'' && val[len(val)-1] == '\'') || (val[0] == '"' && val[len(val)-1] == '"')) {
-				val = val[1 : len(val)-1]
+		eq := strings.IndexByte(s, '=')
+		if eq <= 0 {
+			break
+		}
+		key := strings.TrimSpace(s[:eq])
+		rest := strings.TrimLeft(s[eq+1:], " \t")
+		var val string
+		if len(rest) > 0 && (rest[0] == '\'' || rest[0] == '"') {
+			quote := rest[0]
+			closing := string([]byte{quote, ';'})
+			content := rest[1:]
+			end := findICYClosing(content, closing)
+			if end >= 0 {
+				val = strings.ReplaceAll(content[:end], `\`+string(quote), string(quote))
+				s = content[end+len(closing):]
+			} else if len(content) > 0 && content[len(content)-1] == quote {
+				val = strings.ReplaceAll(content[:len(content)-1], `\`+string(quote), string(quote))
+				s = ""
+			} else {
+				val = content
+				s = ""
 			}
-			switch strings.ToLower(key) {
-			case "streamtitle":
-				title = val
-			case "streamurl":
-				url = val
+		} else {
+			if idx := strings.IndexByte(rest, ';'); idx >= 0 {
+				val = strings.TrimSpace(rest[:idx])
+				s = rest[idx+1:]
+			} else {
+				val = strings.TrimSpace(rest)
+				s = ""
 			}
+		}
+		switch strings.ToLower(key) {
+		case "streamtitle":
+			title = val
+		case "streamurl":
+			url = val
 		}
 	}
 	return title, url
+}
+
+func findICYClosing(s, closing string) int {
+	offset := 0
+	for {
+		idx := strings.Index(s[offset:], closing)
+		if idx < 0 {
+			return -1
+		}
+		pos := offset + idx
+		backslashes := 0
+		for i := pos - 1; i >= 0 && s[i] == '\\'; i-- {
+			backslashes++
+		}
+		if backslashes%2 == 0 {
+			return pos
+		}
+		offset = pos + len(closing)
+	}
 }

@@ -87,6 +87,7 @@ type Defaults struct {
 	BufferDuration       Duration `yaml:"buffer_duration" json:"buffer_duration"`
 	WriteInterval        Duration `yaml:"write_interval" json:"write_interval"`
 	ListenerWriteTimeout Duration `yaml:"listener_write_timeout" json:"listener_write_timeout"`
+	RelayIdleTimeout     Duration `yaml:"relay_idle_timeout" json:"relay_idle_timeout"`
 	ICYMetaInterval      int      `yaml:"icy_meta_interval" json:"icy_meta_interval"`
 	MaxSourceBitrate     int      `yaml:"max_source_bitrate" json:"max_source_bitrate"`
 }
@@ -104,17 +105,19 @@ type Mount struct {
 	FailbackDelay        Duration         `yaml:"failback_delay,omitempty" json:"failback_delay,omitempty"`
 	BufferDuration       Duration         `yaml:"buffer_duration,omitempty" json:"buffer_duration,omitempty"`
 	ListenerWriteTimeout Duration         `yaml:"listener_write_timeout,omitempty" json:"listener_write_timeout,omitempty"`
+	RelayIdleTimeout     Duration         `yaml:"relay_idle_timeout,omitempty" json:"relay_idle_timeout,omitempty"`
 	ICYMetaInterval      int              `yaml:"icy_meta_interval,omitempty" json:"icy_meta_interval,omitempty"`
 	CORSOrigins          []string         `yaml:"cors_origins,omitempty" json:"cors_origins,omitempty"`
 }
 
 type RelayConfig struct {
-	URL          string   `yaml:"url" json:"url"`
-	Username     string   `yaml:"username,omitempty" json:"username,omitempty"`
-	Password     string   `yaml:"password,omitempty" json:"password,omitempty"`
-	PasswordEnv  string   `yaml:"password_env,omitempty" json:"password_env,omitempty"`
-	PasswordFile string   `yaml:"password_file,omitempty" json:"password_file,omitempty"`
-	RetryDelay   Duration `yaml:"retry_delay,omitempty" json:"retry_delay,omitempty"`
+	URL              string   `yaml:"url" json:"url"`
+	Username         string   `yaml:"username,omitempty" json:"username,omitempty"`
+	Password         string   `yaml:"password,omitempty" json:"password,omitempty"`
+	PasswordEnv      string   `yaml:"password_env,omitempty" json:"password_env,omitempty"`
+	PasswordFile     string   `yaml:"password_file,omitempty" json:"password_file,omitempty"`
+	RetryDelay       Duration `yaml:"retry_delay,omitempty" json:"retry_delay,omitempty"`
+	RelayIdleTimeout Duration `yaml:"relay_idle_timeout,omitempty" json:"relay_idle_timeout,omitempty"`
 }
 
 type SourceCredential struct {
@@ -162,6 +165,7 @@ func Default() Config {
 			BufferDuration:       Duration(2 * time.Second),
 			WriteInterval:        Duration(100 * time.Millisecond),
 			ListenerWriteTimeout: Duration(10 * time.Second),
+			RelayIdleTimeout:     Duration(10 * time.Second),
 			ICYMetaInterval:      16000,
 			MaxSourceBitrate:     512000,
 		},
@@ -247,6 +251,12 @@ func (c *Config) Normalize(baseDir string) error {
 	}
 	if c.Defaults.ListenerWriteTimeout < 0 || c.Server.ListenerWriteTimeout < 0 {
 		return errors.New("listener_write_timeout must be positive")
+	}
+	if c.Defaults.RelayIdleTimeout == 0 {
+		c.Defaults.RelayIdleTimeout = Duration(10 * time.Second)
+	}
+	if c.Defaults.RelayIdleTimeout < 0 {
+		return errors.New("relay_idle_timeout must be positive")
 	}
 	if c.Defaults.ICYMetaInterval == 0 {
 		c.Defaults.ICYMetaInterval = 16000
@@ -402,6 +412,20 @@ func normalizeMount(m *Mount, d Defaults, baseDir string) error {
 	}
 	if m.ListenerWriteTimeout <= 0 {
 		return errors.New("listener_write_timeout must be positive")
+	}
+	if m.RelayIdleTimeout == 0 {
+		m.RelayIdleTimeout = d.RelayIdleTimeout
+	}
+	if m.RelayIdleTimeout <= 0 {
+		return errors.New("relay_idle_timeout must be positive")
+	}
+	if m.Relay != nil {
+		if m.Relay.RelayIdleTimeout == 0 {
+			m.Relay.RelayIdleTimeout = m.RelayIdleTimeout
+		}
+		if m.Relay.RelayIdleTimeout <= 0 {
+			return errors.New("relay_idle_timeout must be positive")
+		}
 	}
 	if m.ICYMetaInterval == 0 {
 		m.ICYMetaInterval = d.ICYMetaInterval

@@ -15,6 +15,15 @@ func TestParseICYMetadata(t *testing.T) {
 	if url != "https://radio.example" {
 		t.Fatalf("unexpected url %q", url)
 	}
+
+	withSemicolon := []byte("StreamTitle='Artist; feat. B - Song';StreamUrl='https://radio.example/track;1';\x00")
+	title, url = ParseICYMetadata(withSemicolon)
+	if title != "Artist; feat. B - Song" {
+		t.Fatalf("expected title with semicolon, got %q", title)
+	}
+	if url != "https://radio.example/track;1" {
+		t.Fatalf("expected url with semicolon, got %q", url)
+	}
 }
 
 func TestICYReaderExtractsMetadataAndPreservesAudio(t *testing.T) {
