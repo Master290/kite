@@ -774,10 +774,10 @@ func TestStalledHTTP2ListenerDisconnectedWithinWriteTimeout(t *testing.T) {
 		t.Fatalf("stalled HTTP/2 TLS listener was not removed within timeout: listeners=%d", got)
 	}
 	metrics := metricsOutput(t, s)
-	if !strings.Contains(metrics, `kite_listeners{mount="/radio",transport="http"} 0`) {
-		t.Fatalf("expected kite_listeners gauge to be 0, got:\n%s", metrics)
+	if !strings.Contains(metrics, `kite_listeners{mount="/radio",transport="http2"} 0`) {
+		t.Fatalf("expected kite_listeners http2 gauge to be 0, got:\n%s", metrics)
 	}
-	if !strings.Contains(metrics, `kite_listener_disconnects_total{mount="/radio",reason="write_timeout",transport="http"} 1`) {
+	if !strings.Contains(metrics, `kite_listener_disconnects_total{mount="/radio",reason="write_timeout",transport="http2"} 1`) {
 		t.Fatalf("expected write_timeout disconnect metric for HTTP/2 listener, got:\n%s", metrics)
 	}
 }
@@ -929,5 +929,17 @@ func TestListenerCounterDecrementedOnceOnConcurrentTimeoutAndDisconnect(t *testi
 	}
 	if strings.Contains(metrics, `kite_listener_disconnects_total{mount="/radio",reason="client_closed",transport="http"}`) {
 		t.Fatalf("unexpected double disconnect in metrics:\n%s", metrics)
+	}
+}
+
+func TestListenerTransportLabelsByProtocolMajor(t *testing.T) {
+	if got := listenerTransport(&http.Request{ProtoMajor: 1}); got != "http" {
+		t.Fatalf("ProtoMajor=1 transport=%q, want http", got)
+	}
+	if got := listenerTransport(&http.Request{ProtoMajor: 2}); got != "http2" {
+		t.Fatalf("ProtoMajor=2 transport=%q, want http2", got)
+	}
+	if got := listenerTransport(&http.Request{ProtoMajor: 3}); got != "http3" {
+		t.Fatalf("ProtoMajor=3 transport=%q, want http3", got)
 	}
 }

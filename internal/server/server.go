@@ -315,7 +315,7 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 		s.streamICY(w, r, m)
 		return
 	}
-	sub := m.Subscribe("http")
+	sub := m.Subscribe(listenerTransport(r))
 	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration(), s.listenerWriteTimeout(m))
 	defer writer.Flush()
 	if err := writer.Flush(); err != nil {
@@ -944,6 +944,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func listenerTransport(r *http.Request) string {
+	switch r.ProtoMajor {
+	case 2:
+		return "http2"
+	case 3:
+		return "http3"
+	default:
+		return "http"
+	}
+}
+
 func (s *Server) listenerWriteTimeout(m *stream.Mount) time.Duration {
 	if m != nil {
 		if d := m.Config().ListenerWriteTimeout.Duration(); d > 0 {
@@ -961,6 +972,8 @@ func (s *Server) listenerWriteTimeout(m *stream.Mount) time.Duration {
 	return 10 * time.Second
 }
 
+// http2Config returns connection-level HTTP/2 settings using the global listener_write_timeout
+// configured at startup (per-mount overrides and hot reload do not apply to connection-level timeouts).
 func (s *Server) http2Config() *http.HTTP2Config {
 	writeTimeout := s.listenerWriteTimeout(nil)
 	return &http.HTTP2Config{
@@ -970,6 +983,8 @@ func (s *Server) http2Config() *http.HTTP2Config {
 	}
 }
 
+// quicConfig returns connection-level QUIC settings using the global listener_write_timeout
+// configured at startup (per-mount overrides and hot reload do not apply to connection-level timeouts).
 func (s *Server) quicConfig() *quic.Config {
 	writeTimeout := s.listenerWriteTimeout(nil)
 	idleTimeout := writeTimeout * 3
@@ -984,7 +999,7 @@ func (s *Server) quicConfig() *quic.Config {
 }
 
 func isDeadlineError(err error) bool {
-	return err != nil && (os.IsTimeout(err) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), os.ErrDeadlineExceeded.Error()))
+	return stream.IsTimeoutError(err)
 }
 
 type intervalWriter struct {

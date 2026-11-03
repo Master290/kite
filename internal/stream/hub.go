@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -794,6 +795,20 @@ func (m *Mount) Status() Status {
 	return Status{Path: cfg.Path, Profile: cfg.Profile, ContentType: cfg.ContentType, Source: m.source, IsRelay: m.isRelay, Active: m.active, Listeners: listeners, Metadata: m.metadata, LastSource: m.lastSource, BytesIn: m.bytesIn, BytesOut: m.bytesOut, BufferBytes: m.ringBytes, BufferLimit: bufferBytes(cfg, defaults), OldestSequence: m.ringFirst, LatestSequence: m.sequence}
 }
 
+func IsTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return os.IsTimeout(err) || strings.Contains(err.Error(), os.ErrDeadlineExceeded.Error())
+}
+
 func Copy(ctx context.Context, dst io.Writer, sub subscription) error {
 	defer sub.Close("client_closed")
 	for {
@@ -804,7 +819,7 @@ func Copy(ctx context.Context, dst io.Writer, sub subscription) error {
 		n, err := dst.Write(chunk.Data)
 		sub.RecordWrite(n)
 		if err != nil {
-			if os.IsTimeout(err) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), os.ErrDeadlineExceeded.Error()) {
+			if IsTimeoutError(err) {
 				sub.Close("write_timeout")
 			}
 			return err

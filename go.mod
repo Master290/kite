@@ -1,13 +1,12 @@
 module github.com/Master290/kite
 
-go 1.26.10
+go 1.26.0
 
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/prometheus/client_golang v1.24.1
 	github.com/quic-go/quic-go v0.61.0
 	golang.org/x/crypto v0.57.0
-	golang.org/x/net v0.60.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -20,6 +19,7 @@ require (
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
