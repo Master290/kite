@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,8 +56,33 @@ type Event struct {
 }
 
 type Metadata struct {
-	Title string `json:"title"`
-	URL   string `json:"url,omitempty"`
+	Title  string `json:"title"`
+	Artist string `json:"artist,omitempty"`
+	Song   string `json:"-"`
+	URL    string `json:"url,omitempty"`
+}
+
+// DisplayTitle returns the track title without prepending Artist when Artist
+// was provided separately; otherwise it returns the full Title string as-is.
+func (m Metadata) DisplayTitle() string {
+	if m.Song != "" {
+		return m.Song
+	}
+	return m.Title
+}
+
+// StreamTitle returns the combined "Artist - Title" string for ICY metadata.
+func (m Metadata) StreamTitle() string {
+	if m.Title != "" {
+		if m.Artist != "" && m.Song == "" && !strings.HasPrefix(m.Title, m.Artist+" - ") {
+			return m.Artist + " - " + m.Title
+		}
+		return m.Title
+	}
+	if m.Artist != "" && m.Song != "" {
+		return m.Artist + " - " + m.Song
+	}
+	return m.Song
 }
 
 type Chunk struct {
@@ -222,19 +248,24 @@ func (s subscription) HasBuffered() bool {
 }
 
 func (s subscription) Next(ctx context.Context) (Chunk, error) {
+	ch, _, err := s.NextOrTimeout(ctx, nil)
+	return ch, err
+}
+
+func (s subscription) NextOrTimeout(ctx context.Context, timeout <-chan time.Time) (Chunk, bool, error) {
 	path := s.mount.Config().Path
 	for {
 		s.mount.mu.Lock()
 		listener, ok := s.mount.listeners[s.id]
 		if !ok {
 			s.mount.mu.Unlock()
-			return Chunk{}, ErrSubscriptionClosed
+			return Chunk{}, false, ErrSubscriptionClosed
 		}
 		if listener.preludeIndex < len(listener.prelude) {
 			data := listener.prelude[listener.preludeIndex]
 			listener.preludeIndex++
 			s.mount.mu.Unlock()
-			return Chunk{Data: data, At: time.Now()}, nil
+			return Chunk{Data: data, At: time.Now()}, false, nil
 		}
 		if len(s.mount.ring) > 0 && listener.cursor < s.mount.ringFirst {
 			delete(s.mount.listeners, s.id)
@@ -242,7 +273,7 @@ func (s subscription) Next(ctx context.Context) (Chunk, error) {
 			if !listener.internal {
 				s.mount.observer.ListenerClosed(path, listener.transport, "slow")
 			}
-			return Chunk{}, ErrSlowListener
+			return Chunk{}, false, ErrSlowListener
 		}
 		if len(s.mount.ring) > 0 && listener.cursor >= s.mount.ringFirst && listener.cursor <= s.mount.sequence {
 			index := listener.cursor - s.mount.ringFirst
@@ -250,17 +281,24 @@ func (s subscription) Next(ctx context.Context) (Chunk, error) {
 				chunk := s.mount.ring[index]
 				listener.cursor++
 				s.mount.mu.Unlock()
-				return chunk, nil
+				return chunk, false, nil
 			}
 		}
 		notify := s.mount.notify
 		s.mount.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return Chunk{}, ctx.Err()
+			return Chunk{}, false, ctx.Err()
+		case <-timeout:
+			return Chunk{}, true, nil
 		case <-notify:
 		}
 	}
+}
+
+func (s subscription) writeInterval() time.Duration {
+	_, defaults := s.mount.settings()
+	return defaults.WriteInterval.Duration()
 }
 
 func (s subscription) RecordWrite(n int) {
@@ -480,6 +518,7 @@ func (m *Mount) AcquireSource() error {
 	m.sourceSince = time.Now()
 	m.lastSource = m.sourceSince
 	m.primaryMeta = Metadata{}
+	m.sourceStreamMeta = SourceStreamMetadata{}
 	m.initChunks = nil
 	m.mu.Unlock()
 	m.observer.SourceConnected(m.Config().Path)
@@ -502,6 +541,7 @@ func (m *Mount) acquireRelaySourceWithCloser(closer io.Closer) error {
 		m.sourceSince = time.Now()
 		m.lastSource = m.sourceSince
 		m.primaryMeta = Metadata{}
+		m.sourceStreamMeta = SourceStreamMetadata{}
 		m.initChunks = nil
 		m.mu.Unlock()
 		m.observer.SourceConnected(m.Config().Path)
@@ -524,6 +564,12 @@ func (m *Mount) ReleaseSource() {
 	m.isRelay = false
 	m.disconnecting = false
 	m.sourceCloser = nil
+	m.sourceSince = time.Time{}
+	m.sourceStreamMeta = SourceStreamMetadata{}
+	m.primaryMeta = Metadata{}
+	if !m.fallbackTitled {
+		m.metadata = Metadata{}
+	}
 	m.mu.Unlock()
 	m.observer.SourceDisconnected(m.Config().Path)
 	m.publish("source", map[string]any{"connected": false, "is_relay": false})
@@ -591,12 +637,26 @@ func (m *Mount) Write(p []byte) error {
 }
 
 func (m *Mount) SetMetadata(md Metadata) {
+	if md.Title == "" && md.Song != "" {
+		if md.Artist != "" {
+			md.Title = md.Artist + " - " + md.Song
+		} else {
+			md.Title = md.Song
+		}
+	} else if md.Artist != "" && md.Song == "" && md.Title != "" && !strings.HasPrefix(md.Title, md.Artist+" - ") {
+		md.Song = md.Title
+		md.Title = md.Artist + " - " + md.Song
+	}
 	m.mu.Lock()
 	m.primaryMeta = md
 	m.metadata = md
 	m.fallbackTitled = false
 	m.mu.Unlock()
-	m.publish("metadata", map[string]any{"title": md.Title, "url": md.URL})
+	payload := map[string]any{"title": md.Title, "url": md.URL}
+	if md.Artist != "" {
+		payload["artist"] = md.Artist
+	}
+	m.publish("metadata", payload)
 }
 
 func (m *Mount) setFallbackMetadata(md Metadata) {
@@ -654,6 +714,7 @@ func (m *Mount) StreamMetadata() config.Metadata {
 	if out.Bitrate <= 0 {
 		out.Bitrate = src.Bitrate
 	}
+	out.Bitrate = config.NormalizeBitrateKbps(out.Bitrate)
 	if !cfg.Metadata.PublicSet && !cfg.Metadata.Public && src.PublicSet {
 		out.Public = src.Public
 	}
@@ -665,7 +726,7 @@ func (m *Mount) SourceAudioInfo() string {
 	info := m.sourceStreamMeta.AudioInfo
 	m.mu.RUnlock()
 	if info != "" {
-		return info
+		return normalizeAudioInfoBitrate(info)
 	}
 	if br := m.StreamMetadata().Bitrate; br > 0 {
 		return fmt.Sprintf("bitrate=%d", br)
@@ -673,12 +734,31 @@ func (m *Mount) SourceAudioInfo() string {
 	return ""
 }
 
+func normalizeAudioInfoBitrate(info string) string {
+	parts := strings.Split(info, ";")
+	for i, part := range parts {
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		keyLower := strings.ToLower(strings.TrimSpace(k))
+		if keyLower == "bitrate" || keyLower == "ice-bitrate" {
+			if br, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && br >= 1000 {
+				parts[i] = strings.TrimSpace(k) + "=" + strconv.Itoa(config.NormalizeBitrateKbps(br))
+			}
+		}
+	}
+	return strings.Join(parts, ";")
+}
+
 func (m *Mount) SourceIP() string {
 	m.mu.RLock()
-	ip := m.sourceStreamMeta.SourceIP
-	m.mu.RUnlock()
-	if ip != "" {
-		return ip
+	defer m.mu.RUnlock()
+	if !m.source {
+		return ""
+	}
+	if m.sourceStreamMeta.SourceIP != "" {
+		return m.sourceStreamMeta.SourceIP
 	}
 	return "127.0.0.1"
 }
@@ -686,10 +766,10 @@ func (m *Mount) SourceIP() string {
 func (m *Mount) StreamStart() time.Time {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if !m.sourceSince.IsZero() {
-		return m.sourceSince
+	if !m.source {
+		return time.Time{}
 	}
-	return m.createdAt
+	return m.sourceSince
 }
 
 func (m *Mount) ListenerPeak() int {
@@ -905,9 +985,9 @@ func burstBytes(cfg config.Mount, defaults config.Defaults) int {
 }
 
 func bufferBytes(cfg config.Mount, defaults config.Defaults) int {
-	bitrate := cfg.Metadata.Bitrate
+	bitrate := config.NormalizeBitrateBps(cfg.Metadata.Bitrate)
 	if bitrate <= 0 {
-		bitrate = defaults.MaxSourceBitrate
+		bitrate = config.NormalizeBitrateBps(defaults.MaxSourceBitrate)
 	}
 	dur := cfg.BufferDuration.Duration()
 	if dur <= 0 {
@@ -918,7 +998,7 @@ func bufferBytes(cfg config.Mount, defaults config.Defaults) int {
 		bytes = 16 << 10
 	}
 	burst := burstBytes(cfg, defaults)
-	if bytes < burst && (cfg.BurstBytes > 0 || cfg.Metadata.Bitrate == 0 || cfg.Metadata.Bitrate >= 64000) {
+	if bytes < burst && (cfg.BurstBytes > 0 || cfg.Metadata.Bitrate == 0 || config.NormalizeBitrateBps(cfg.Metadata.Bitrate) >= 64000) {
 		bytes = burst
 	}
 	if bytes > 64<<20 {
@@ -1178,6 +1258,7 @@ func (m *Mount) InitialChunks() [][]byte {
 
 func pumpFile(ctx context.Context, path, profile string, bitrate int, out chan<- []byte) {
 	defer close(out)
+	bitrate = config.NormalizeBitrateBps(bitrate)
 	if bitrate <= 0 {
 		bitrate = 128000
 	}
@@ -1407,6 +1488,10 @@ func findFrameBoundary(profile string, b []byte) int {
 	}
 }
 
+func (m *Mount) CloseListeners(reason string) {
+	m.closeListeners(reason)
+}
+
 func (m *Mount) closeListeners(reason string) {
 	path := m.Config().Path
 	m.mu.Lock()
@@ -1457,29 +1542,108 @@ func IsTimeoutError(err error) bool {
 	return os.IsTimeout(err) || strings.Contains(err.Error(), os.ErrDeadlineExceeded.Error())
 }
 
+const coalesceByteThreshold = 4096
+
 func Copy(ctx context.Context, dst io.Writer, sub subscription) error {
 	defer sub.Close("client_closed")
 	flusher, _ := dst.(interface{ Flush() error })
-	for {
-		chunk, err := sub.Next(ctx)
-		if err != nil {
-			return err
-		}
-		n, err := dst.Write(chunk.Data)
-		sub.RecordWrite(n)
-		if err != nil {
-			if IsTimeoutError(err) {
-				sub.Close("write_timeout")
+	writeInterval := sub.writeInterval()
+	inBurst := sub.HasBuffered()
+	buf := make([]byte, 0, coalesceByteThreshold*2)
+
+	flushBuf := func(doFlush bool) error {
+		if len(buf) > 0 {
+			n, err := dst.Write(buf)
+			sub.RecordWrite(n)
+			buf = buf[:0]
+			if err != nil {
+				if IsTimeoutError(err) {
+					sub.Close("write_timeout")
+				}
+				return err
 			}
-			return err
 		}
-		if flusher != nil && !sub.HasBuffered() {
+		if doFlush && flusher != nil {
 			if err := flusher.Flush(); err != nil {
 				if IsTimeoutError(err) {
 					sub.Close("write_timeout")
 				}
 				return err
 			}
+		}
+		return nil
+	}
+	defer func() { _ = flushBuf(true) }()
+
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	for {
+		chunk, err := sub.Next(ctx)
+		if err != nil {
+			return err
+		}
+		buf = append(buf, chunk.Data...)
+
+		for sub.HasBuffered() && len(buf) < coalesceByteThreshold {
+			nextChunk, err := sub.Next(ctx)
+			if err != nil {
+				return err
+			}
+			buf = append(buf, nextChunk.Data...)
+		}
+
+		if inBurst {
+			caughtUp := !sub.HasBuffered()
+			if len(buf) >= coalesceByteThreshold || caughtUp {
+				if err := flushBuf(caughtUp); err != nil {
+					return err
+				}
+			}
+			if caughtUp {
+				inBurst = false
+			}
+			continue
+		}
+
+		if writeInterval <= 0 || len(buf) >= coalesceByteThreshold {
+			if err := flushBuf(true); err != nil {
+				return err
+			}
+			continue
+		}
+
+		deadline := time.Now().Add(writeInterval)
+		if timer == nil {
+			timer = time.NewTimer(writeInterval)
+		}
+		for len(buf) < coalesceByteThreshold {
+			rem := time.Until(deadline)
+			if rem <= 0 {
+				break
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(rem)
+			nextChunk, timedOut, err := sub.NextOrTimeout(ctx, timer.C)
+			if err != nil {
+				return err
+			}
+			if timedOut {
+				break
+			}
+			buf = append(buf, nextChunk.Data...)
+		}
+		if err := flushBuf(true); err != nil {
+			return err
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,10 +25,16 @@ import (
 func publicServer(t *testing.T, mutators ...func(*config.Config)) (*Server, *httptest.Server) {
 	t.Helper()
 	t.Setenv("ADMIN_TOKEN", "admin")
+	t.Setenv("ICECAST_ADMIN_PASSWORD", "icecast-admin")
 	t.Setenv("SOURCE_PASSWORD", "source")
 	source := config.SourceCredential{Username: "source", PasswordEnv: "SOURCE_PASSWORD"}
 	cfg := &config.Config{
-		Admin: config.Admin{Address: "127.0.0.1:9090", TokenEnv: "ADMIN_TOKEN"},
+		Admin: config.Admin{
+			Address:                 "127.0.0.1:9090",
+			TokenEnv:                "ADMIN_TOKEN",
+			IcecastAdminUser:        "admin",
+			IcecastAdminPasswordEnv: "ICECAST_ADMIN_PASSWORD",
+		},
 		Defaults: config.Defaults{
 			SourceTimeout:    config.Duration(250 * time.Millisecond),
 			FailbackDelay:    config.Duration(250 * time.Millisecond),
@@ -399,6 +406,10 @@ func readBodyBytes(t *testing.T, body io.Reader, n int, timeout time.Duration) [
 
 func TestStatusJSONFiltersHiddenMounts(t *testing.T) {
 	s, ts := publicServer(t)
+	mRadio, _ := s.hub.Get("/radio")
+	acquireTestSource(t, mRadio)
+	mPriv, _ := s.hub.Get("/private")
+	acquireTestSource(t, mPriv)
 	waitForListeners(t, s, "/radio", 0)
 	resp, err := http.Get(ts.URL + "/status-json.xsl")
 	if err != nil {
@@ -482,21 +493,15 @@ func TestAdminMetadataRequiresAuthAndUpdatesMount(t *testing.T) {
 	if okResp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d", okResp.StatusCode)
 	}
-	var body struct {
-		OK       bool `json:"ok"`
-		Metadata struct {
-			Title string `json:"title"`
-			URL   string `json:"url"`
-		} `json:"metadata"`
-	}
-	if err := json.NewDecoder(okResp.Body).Decode(&body); err != nil {
+	var body xmlIceResponse
+	if err := xml.NewDecoder(okResp.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if !body.OK || body.Metadata.Title != "Artist - Title" || body.Metadata.URL != "https://example.com" {
+	if body.Return != 1 || body.Message != "Metadata update successful" {
 		t.Fatalf("body=%+v", body)
 	}
 	m, _ := s.hub.Get("/radio")
-	if got := m.Metadata(); got.Title != "Artist - Title" {
+	if got := m.Metadata(); got.Title != "Artist - Title" || got.URL != "https://example.com" {
 		t.Fatalf("hub metadata=%+v", got)
 	}
 }

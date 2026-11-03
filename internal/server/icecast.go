@@ -4,12 +4,17 @@ import (
 	"crypto/subtle"
 	"encoding/xml"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/Master290/kite/internal/config"
 	"github.com/Master290/kite/internal/stream"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -20,7 +25,142 @@ const (
 	defaultIcecastAdmin  = "icemaster@localhost"
 	defaultIcecastLoc    = "Earth"
 	defaultIcecastID     = "Icecast 2.4.4"
+
+	authLockoutThreshold = 5
+	defaultAuthBaseDelay = 2 * time.Second
+	maxAuthLockoutDelay  = 15 * time.Minute
 )
+
+type authLimiter struct {
+	mu        sync.Mutex
+	ips       map[string]*ipAuthState
+	baseDelay time.Duration
+	maxDelay  time.Duration
+	nowFn     func() time.Time
+}
+
+type ipAuthState struct {
+	failures     int
+	lockedUntil  time.Time
+	bcryptWindow time.Time
+	bcryptCount  int
+}
+
+func newAuthLimiter() *authLimiter {
+	return &authLimiter{
+		ips:       make(map[string]*ipAuthState),
+		baseDelay: defaultAuthBaseDelay,
+		maxDelay:  maxAuthLockoutDelay,
+		nowFn:     time.Now,
+	}
+}
+
+func (l *authLimiter) now() time.Time {
+	if l != nil && l.nowFn != nil {
+		return l.nowFn()
+	}
+	return time.Now()
+}
+
+func (l *authLimiter) state(ip string) *ipAuthState {
+	if l.ips == nil {
+		l.ips = make(map[string]*ipAuthState)
+	}
+	st, ok := l.ips[ip]
+	if !ok {
+		st = &ipAuthState{}
+		l.ips[ip] = st
+	}
+	return st
+}
+
+func (l *authLimiter) checkLocked(ip string) (bool, time.Duration, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	st, ok := l.ips[ip]
+	if !ok {
+		return false, 0, 0
+	}
+	now := l.now()
+	if now.Before(st.lockedUntil) {
+		return true, st.lockedUntil.Sub(now), st.failures
+	}
+	return false, 0, st.failures
+}
+
+// allowBcrypt rate-limits bcrypt comparisons per IP before running the expensive
+// hash check to prevent CPU exhaustion under concurrent brute-force floods.
+func (l *authLimiter) allowBcrypt(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	st := l.state(ip)
+	if now.Before(st.lockedUntil) {
+		return false
+	}
+	if st.bcryptWindow.IsZero() || now.Sub(st.bcryptWindow) >= time.Second {
+		st.bcryptWindow = now
+		st.bcryptCount = 0
+	}
+	if st.bcryptCount >= authLockoutThreshold {
+		return false
+	}
+	st.bcryptCount++
+	return true
+}
+
+func (l *authLimiter) recordFailure(ip string) (int, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	st := l.state(ip)
+	st.failures++
+	if st.failures < authLockoutThreshold {
+		return st.failures, 0
+	}
+	base := l.baseDelay
+	if base <= 0 {
+		base = defaultAuthBaseDelay
+	}
+	maxDelay := l.maxDelay
+	if maxDelay <= 0 {
+		maxDelay = maxAuthLockoutDelay
+	}
+	shift := st.failures - authLockoutThreshold
+	if shift > 12 {
+		shift = 12
+	}
+	delay := base << shift
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	st.lockedUntil = now.Add(delay)
+	return st.failures, delay
+}
+
+func (l *authLimiter) recordSuccess(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.ips, ip)
+}
+
+func (s *Server) getAuthLimiter() *authLimiter {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	if s.auth == nil {
+		s.auth = newAuthLimiter()
+	}
+	return s.auth
+}
+
+func writeAuthLockout(w http.ResponseWriter, retryAfter time.Duration) {
+	secs := int(math.Ceil(retryAfter.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	http.Error(w, "too many failed authentication attempts", http.StatusTooManyRequests)
+}
 
 func (s *Server) registerIcecastAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/stats", s.adminBasicAuth(s.handleAdminStats))
@@ -31,14 +171,58 @@ func (s *Server) registerIcecastAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/killsource", s.adminBasicAuth(s.handleAdminKillSource))
 }
 
+func (s *Server) icecastAdminUser() string {
+	cfg := s.Config()
+	if cfg != nil {
+		if cfg.Admin.IcecastAdminUser != "" {
+			return cfg.Admin.IcecastAdminUser
+		}
+		if cfg.Server.IcecastAdminUser != "" {
+			return cfg.Server.IcecastAdminUser
+		}
+	}
+	return "admin"
+}
+
+func (s *Server) icecastAdminPassword() string {
+	cfg := s.Config()
+	if cfg == nil {
+		return ""
+	}
+	if cfg.Admin.IcecastAdminPassword != "" {
+		return cfg.Admin.IcecastAdminPassword
+	}
+	if cfg.Server.IcecastAdminPassword != "" {
+		return cfg.Server.IcecastAdminPassword
+	}
+	if cfg.Admin.IcecastAdminPasswordEnv != "" {
+		if b, err := config.ResolveSecret(cfg.Admin.IcecastAdminPasswordEnv, ""); err == nil {
+			return string(b)
+		}
+		return ""
+	}
+	if cfg.Admin.IcecastAdminPasswordFile != "" {
+		if b, err := config.ResolveSecret("", cfg.Admin.IcecastAdminPasswordFile); err == nil {
+			return string(b)
+		}
+		return ""
+	}
+	return os.Getenv("KITE_ICECAST_ADMIN_PASSWORD")
+}
+
 func (s *Server) adminBasicAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := s.adminToken()
-		if token == "" {
-			http.Error(w, "admin token is not configured", http.StatusServiceUnavailable)
+		expectedPass := s.icecastAdminPassword()
+		if expectedPass == "" {
+			http.Error(w, "icecast admin password is not configured", http.StatusServiceUnavailable)
 			return
 		}
-		if !s.checkAdminBasicAuth(r, token) {
+		ok, locked, retryAfter := s.authenticateBasic(r, "icecast_admin", s.icecastAdminUser(), expectedPass)
+		if locked {
+			writeAuthLockout(w, retryAfter)
+			return
+		}
+		if !ok {
 			w.Header().Set("WWW-Authenticate", `Basic realm="Icecast2 Server"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -47,24 +231,46 @@ func (s *Server) adminBasicAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *Server) checkAdminBasicAuth(r *http.Request, token string) bool {
-	if token == "" {
-		token = s.adminToken()
+func (s *Server) authenticateBasic(r *http.Request, scope, expectedUser, expectedPass string) (ok bool, locked bool, retryAfter time.Duration) {
+	ip := s.requestClientIP(r)
+	limiter := s.getAuthLimiter()
+	user, pass, hasBasic := r.BasicAuth()
+	if isLocked, wait, failures := limiter.checkLocked(ip); isLocked {
+		s.log.Warn("authentication rejected: IP locked out", "scope", scope, "ip", ip, "user", user, "password", "[REDACTED]", "failures", failures, "retry_after", wait.Round(time.Millisecond))
+		return false, true, wait
 	}
-	if token == "" {
-		return false
+	if expectedPass == "" || !hasBasic || user != expectedUser {
+		failures, lockDelay := limiter.recordFailure(ip)
+		s.log.Warn("authentication failed", "scope", scope, "ip", ip, "user", user, "password", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond))
+		return false, false, 0
 	}
-	user, pass, ok := r.BasicAuth()
-	if !ok || user != "admin" {
-		return false
+	if strings.HasPrefix(expectedPass, "$2") {
+		if !limiter.allowBcrypt(ip) {
+			failures, lockDelay := limiter.recordFailure(ip)
+			if lockDelay == 0 {
+				lockDelay = time.Second
+			}
+			s.log.Warn("authentication rate-limited before bcrypt", "scope", scope, "ip", ip, "user", user, "password", "[REDACTED]", "failures", failures)
+			return false, true, lockDelay
+		}
+		if bcrypt.CompareHashAndPassword([]byte(expectedPass), []byte(pass)) != nil {
+			failures, lockDelay := limiter.recordFailure(ip)
+			s.log.Warn("authentication failed", "scope", scope, "ip", ip, "user", user, "password", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond))
+			return false, false, 0
+		}
+		limiter.recordSuccess(ip)
+		return true, false, 0
 	}
-	if strings.HasPrefix(token, "$2") {
-		return bcrypt.CompareHashAndPassword([]byte(token), []byte(pass)) == nil
+	if subtle.ConstantTimeCompare([]byte(expectedPass), []byte(pass)) != 1 {
+		failures, lockDelay := limiter.recordFailure(ip)
+		s.log.Warn("authentication failed", "scope", scope, "ip", ip, "user", user, "password", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond))
+		return false, false, 0
 	}
-	return subtle.ConstantTimeCompare([]byte(token), []byte(pass)) == 1
+	limiter.recordSuccess(ip)
+	return true, false, 0
 }
 
-func parseSourceStreamMetadata(r *http.Request) stream.SourceStreamMetadata {
+func (s *Server) parseSourceStreamMetadata(r *http.Request) stream.SourceStreamMetadata {
 	h := r.Header
 	audioInfo := strings.TrimSpace(h.Get("ice-audio-info"))
 	meta := stream.SourceStreamMetadata{
@@ -73,16 +279,16 @@ func parseSourceStreamMetadata(r *http.Request) stream.SourceStreamMetadata {
 		Genre:       strings.TrimSpace(headerFirst(h, "ice-genre", "icy-genre")),
 		URL:         strings.TrimSpace(headerFirst(h, "ice-url", "icy-url")),
 		AudioInfo:   audioInfo,
-		SourceIP:    requestClientIP(r),
+		SourceIP:    s.requestClientIP(r),
 		ContentType: strings.TrimSpace(h.Get("Content-Type")),
 	}
 	if rawBr := strings.TrimSpace(headerFirst(h, "ice-bitrate", "icy-br", "icy-bitrate")); rawBr != "" {
 		if br, err := strconv.Atoi(rawBr); err == nil && br > 0 {
-			meta.Bitrate = br
+			meta.Bitrate = config.NormalizeBitrateKbps(br)
 		}
 	}
 	if meta.Bitrate == 0 && audioInfo != "" {
-		meta.Bitrate = parseBitrateFromAudioInfo(audioInfo)
+		meta.Bitrate = config.NormalizeBitrateKbps(parseBitrateFromAudioInfo(audioInfo))
 	}
 	if rawPub := strings.TrimSpace(headerFirst(h, "ice-public", "icy-pub", "icy-public")); rawPub != "" {
 		meta.PublicSet = true
@@ -117,21 +323,107 @@ func parseBitrateFromAudioInfo(info string) int {
 	return 0
 }
 
-func requestClientIP(r *http.Request) string {
-	if r == nil || r.RemoteAddr == "" {
+func remoteAddrIP(remoteAddr string) string {
+	if remoteAddr == "" {
 		return "127.0.0.1"
 	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && host != "" {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil && host != "" {
 		return host
 	}
-	return r.RemoteAddr
+	return remoteAddr
 }
 
-func requestBaseURL(r *http.Request) string {
+func (s *Server) isTrustedProxy(remoteAddr string) bool {
+	cfg := s.Config()
+	if cfg == nil {
+		return false
+	}
+	entries := append(append([]string(nil), cfg.Server.TrustedProxies...), cfg.Server.TrustedProxyNetworks...)
+	if len(entries) == 0 {
+		return false
+	}
+	ip := net.ParseIP(remoteAddrIP(remoteAddr))
+	if ip == nil {
+		return false
+	}
+	for _, entry := range entries {
+		if _, cidr, err := net.ParseCIDR(entry); err == nil {
+			if cidr.Contains(ip) {
+				return true
+			}
+			continue
+		}
+		if trustedIP := net.ParseIP(entry); trustedIP != nil && trustedIP.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) requestClientIP(r *http.Request) string {
+	if r == nil {
+		return "127.0.0.1"
+	}
+	if s.isTrustedProxy(r.RemoteAddr) {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			for _, part := range strings.Split(xff, ",") {
+				candidate := strings.TrimSpace(part)
+				if net.ParseIP(candidate) != nil {
+					return candidate
+				}
+			}
+		}
+		if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" && net.ParseIP(xrip) != nil {
+			return xrip
+		}
+	}
+	return remoteAddrIP(r.RemoteAddr)
+}
+
+func firstForwardedValue(v string) string {
+	if idx := strings.IndexByte(v, ','); idx >= 0 {
+		v = v[:idx]
+	}
+	return strings.TrimSpace(v)
+}
+
+func (s *Server) requestBaseURL(r *http.Request) string {
+	cfg := s.Config()
+	trusted := r != nil && s.isTrustedProxy(r.RemoteAddr)
+
+	if trusted {
+		xfProto := strings.ToLower(firstForwardedValue(r.Header.Get("X-Forwarded-Proto")))
+		xfHost := firstForwardedValue(r.Header.Get("X-Forwarded-Host"))
+		if xfHost != "" {
+			scheme := "http"
+			if xfProto == "https" || xfProto == "http" {
+				scheme = xfProto
+			} else if r.TLS != nil {
+				scheme = "https"
+			}
+			return scheme + "://" + xfHost
+		}
+	}
+
+	if cfg != nil && cfg.Server.PublicURL != "" {
+		return strings.TrimRight(cfg.Server.PublicURL, "/")
+	}
+
 	scheme := "http"
-	if r != nil && r.TLS != nil {
+	if trusted {
+		if xfProto := strings.ToLower(firstForwardedValue(r.Header.Get("X-Forwarded-Proto"))); xfProto == "https" || xfProto == "http" {
+			scheme = xfProto
+		} else if r != nil && r.TLS != nil {
+			scheme = "https"
+		}
+	} else if r != nil && r.TLS != nil {
 		scheme = "https"
 	}
+
+	if cfg != nil && cfg.Server.Hostname != "" {
+		return scheme + "://" + cfg.Server.Hostname
+	}
+
 	host := "localhost"
 	if r != nil && r.Host != "" {
 		host = r.Host
@@ -139,28 +431,18 @@ func requestBaseURL(r *http.Request) string {
 	return scheme + "://" + host
 }
 
-func requestHostOnly(r *http.Request, cfgHosts []string) string {
-	if r != nil && r.Host != "" {
-		if h, _, err := net.SplitHostPort(r.Host); err == nil && h != "" {
+func (s *Server) requestHostOnly(r *http.Request) string {
+	base := s.requestBaseURL(r)
+	if u, err := url.Parse(base); err == nil && u.Host != "" {
+		if h, _, err := net.SplitHostPort(u.Host); err == nil && h != "" {
 			return h
 		}
-		return r.Host
+		return u.Host
 	}
-	if len(cfgHosts) > 0 && cfgHosts[0] != "" {
-		return cfgHosts[0]
+	if cfg := s.Config(); cfg != nil && len(cfg.TLS.Hosts) > 0 && cfg.TLS.Hosts[0] != "" {
+		return cfg.TLS.Hosts[0]
 	}
 	return "localhost"
-}
-
-func splitArtistTitle(raw string) (artist, title string) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", ""
-	}
-	if a, t, ok := strings.Cut(raw, " - "); ok {
-		return strings.TrimSpace(a), strings.TrimSpace(t)
-	}
-	return "", raw
 }
 
 func boolToZeroOne(b bool) string {
@@ -177,7 +459,7 @@ type icecastJSONStats struct {
 	ServerID           string `json:"server_id"`
 	ServerStart        string `json:"server_start"`
 	ServerStartISO8601 string `json:"server_start_iso8601"`
-	Source             any    `json:"source"`
+	Source             any    `json:"source,omitempty"`
 }
 
 type icecastJSONSource struct {
@@ -189,7 +471,7 @@ type icecastJSONSource struct {
 	Genre              string `json:"genre"`
 	Bitrate            int    `json:"bitrate"`
 	Title              string `json:"title"`
-	Artist             string `json:"artist"`
+	Artist             string `json:"artist,omitempty"`
 	Listeners          int    `json:"listeners"`
 	ListenerPeak       int    `json:"listener_peak"`
 	StreamStart        string `json:"stream_start"`
@@ -201,22 +483,26 @@ type icecastJSONSource struct {
 func (s *Server) buildJSONSource(r *http.Request, m *stream.Mount) icecastJSONSource {
 	st := m.Status()
 	meta := m.StreamMetadata()
-	artist, title := splitArtistTitle(st.Metadata.Title)
 	streamStart := m.StreamStart()
+	var startStr, startISO string
+	if !streamStart.IsZero() {
+		startStr = streamStart.Format(icecastTimeFormat)
+		startISO = streamStart.Format(icecastISO8601Format)
+	}
 	return icecastJSONSource{
-		ListenURL:          requestBaseURL(r) + st.Path,
+		ListenURL:          s.requestBaseURL(r) + st.Path,
 		ServerName:         meta.Name,
 		ServerDescription:  meta.Description,
 		ServerType:         st.ContentType,
 		ServerURL:          meta.URL,
 		Genre:              meta.Genre,
 		Bitrate:            meta.Bitrate,
-		Title:              title,
-		Artist:             artist,
+		Title:              st.Metadata.DisplayTitle(),
+		Artist:             st.Metadata.Artist,
 		Listeners:          st.Listeners,
 		ListenerPeak:       m.ListenerPeak(),
-		StreamStart:        streamStart.Format(icecastTimeFormat),
-		StreamStartISO8601: streamStart.Format(icecastISO8601Format),
+		StreamStart:        startStr,
+		StreamStartISO8601: startISO,
 		AudioInfo:          m.SourceAudioInfo(),
 		Path:               st.Path,
 	}
@@ -237,27 +523,32 @@ func (s *Server) startedTime() time.Time {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	cfg := s.Config()
 	items := make([]icecastJSONSource, 0)
 	for _, m := range s.hub.Mounts() {
 		mCfg := m.Config()
 		if mCfg.Hidden {
 			continue
 		}
+		st := m.Status()
+		meta := m.StreamMetadata()
+		if !st.Source || !meta.Public {
+			continue
+		}
 		items = append(items, s.buildJSONSource(r, m))
 	}
-	var sourceField any = items
-	if len(items) == 1 {
+	var sourceField any
+	switch len(items) {
+	case 0:
+		sourceField = nil
+	case 1:
 		sourceField = items[0]
+	default:
+		sourceField = items
 	}
 	start := s.startedTime()
-	var hosts []string
-	if cfg != nil {
-		hosts = cfg.TLS.Hosts
-	}
 	stats := icecastJSONStats{
 		Admin:              s.serverAdminEmail(),
-		Host:               requestHostOnly(r, hosts),
+		Host:               s.requestHostOnly(r),
 		Location:           defaultIcecastLoc,
 		ServerID:           defaultIcecastID,
 		ServerStart:        start.Format(icecastTimeFormat),
@@ -292,7 +583,7 @@ type xmlIceStats struct {
 type xmlStatsSource struct {
 	Mount              string `xml:"mount,attr"`
 	AudioInfo          string `xml:"audio_info"`
-	Artist             string `xml:"artist"`
+	Artist             string `xml:"artist,omitempty"`
 	Bitrate            int    `xml:"bitrate"`
 	Connected          int64  `xml:"connected"`
 	Genre              string `xml:"genre"`
@@ -306,20 +597,15 @@ type xmlStatsSource struct {
 	ServerType         string `xml:"server_type"`
 	ServerURL          string `xml:"server_url"`
 	SlowListeners      int    `xml:"slow_listeners"`
-	SourceIP           string `xml:"source_ip"`
-	StreamStart        string `xml:"stream_start"`
-	StreamStartISO8601 string `xml:"stream_start_iso8601"`
+	SourceIP           string `xml:"source_ip,omitempty"`
+	StreamStart        string `xml:"stream_start,omitempty"`
+	StreamStartISO8601 string `xml:"stream_start_iso8601,omitempty"`
 	Title              string `xml:"title"`
 	TotalBytesRead     uint64 `xml:"total_bytes_read"`
 	TotalBytesSent     uint64 `xml:"total_bytes_sent"`
 }
 
 func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
-	cfg := s.Config()
-	var hosts []string
-	if cfg != nil {
-		hosts = cfg.TLS.Hosts
-	}
 	mounts := s.hub.Mounts()
 	sources := make([]xmlStatsSource, 0, len(mounts))
 	totalListeners := 0
@@ -329,11 +615,16 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
 	for _, m := range mounts {
 		st := m.Status()
 		meta := m.StreamMetadata()
-		artist, title := splitArtistTitle(st.Metadata.Title)
 		streamStart := m.StreamStart()
-		connectedSec := int64(now.Sub(streamStart).Seconds())
-		if connectedSec < 0 {
-			connectedSec = 0
+		var connectedSec int64
+		var streamStartStr, streamStartISO string
+		if st.Source && !streamStart.IsZero() {
+			connectedSec = int64(now.Sub(streamStart).Seconds())
+			if connectedSec < 0 {
+				connectedSec = 0
+			}
+			streamStartStr = streamStart.Format(icecastTimeFormat)
+			streamStartISO = streamStart.Format(icecastISO8601Format)
 		}
 		pub := 0
 		if meta.Public {
@@ -350,13 +641,13 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
 		sources = append(sources, xmlStatsSource{
 			Mount:              st.Path,
 			AudioInfo:          m.SourceAudioInfo(),
-			Artist:             artist,
+			Artist:             st.Metadata.Artist,
 			Bitrate:            meta.Bitrate,
 			Connected:          connectedSec,
 			Genre:              meta.Genre,
 			ListenerPeak:       m.ListenerPeak(),
 			Listeners:          st.Listeners,
-			ListenURL:          requestBaseURL(r) + st.Path,
+			ListenURL:          s.requestBaseURL(r) + st.Path,
 			MaxListeners:       "unlimited",
 			Public:             pub,
 			ServerDescription:  meta.Description,
@@ -365,9 +656,9 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
 			ServerURL:          meta.URL,
 			SlowListeners:      0,
 			SourceIP:           m.SourceIP(),
-			StreamStart:        streamStart.Format(icecastTimeFormat),
-			StreamStartISO8601: streamStart.Format(icecastISO8601Format),
-			Title:              title,
+			StreamStart:        streamStartStr,
+			StreamStartISO8601: streamStartISO,
+			Title:              st.Metadata.DisplayTitle(),
 			TotalBytesRead:     st.BytesIn,
 			TotalBytesSent:     st.BytesOut,
 		})
@@ -378,7 +669,7 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
 		Admin:                   s.serverAdminEmail(),
 		Clients:                 totalListeners + activeSources,
 		Connections:             totalListeners + activeSources,
-		Host:                    requestHostOnly(r, hosts),
+		Host:                    s.requestHostOnly(r),
 		ListenerConnections:     totalListeners,
 		Listeners:               totalListeners,
 		Location:                defaultIcecastLoc,
@@ -388,7 +679,7 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
 		SourceClientConnections: directSources,
 		SourceRelayConnections:  relaySources,
 		SourceTotalConnections:  activeSources,
-		Sources:                 len(sources),
+		Sources:                 activeSources,
 		Source:                  sources,
 	}
 	writeXML(w, http.StatusOK, doc)
@@ -413,7 +704,7 @@ type xmlMountRecord struct {
 	Public            int    `xml:"public"`
 	ListenURL         string `xml:"listenurl"`
 	Title             string `xml:"title"`
-	Artist            string `xml:"artist"`
+	Artist            string `xml:"artist,omitempty"`
 }
 
 func (s *Server) handleAdminListMounts(w http.ResponseWriter, r *http.Request) {
@@ -423,10 +714,13 @@ func (s *Server) handleAdminListMounts(w http.ResponseWriter, r *http.Request) {
 	for _, m := range mounts {
 		st := m.Status()
 		meta := m.StreamMetadata()
-		artist, title := splitArtistTitle(st.Metadata.Title)
-		connectedSec := int64(now.Sub(m.StreamStart()).Seconds())
-		if connectedSec < 0 {
-			connectedSec = 0
+		streamStart := m.StreamStart()
+		var connectedSec int64
+		if st.Source && !streamStart.IsZero() {
+			connectedSec = int64(now.Sub(streamStart).Seconds())
+			if connectedSec < 0 {
+				connectedSec = 0
+			}
 		}
 		pub := 0
 		if meta.Public {
@@ -444,9 +738,9 @@ func (s *Server) handleAdminListMounts(w http.ResponseWriter, r *http.Request) {
 			Genre:             meta.Genre,
 			Bitrate:           meta.Bitrate,
 			Public:            pub,
-			ListenURL:         requestBaseURL(r) + st.Path,
-			Title:             title,
-			Artist:            artist,
+			ListenURL:         s.requestBaseURL(r) + st.Path,
+			Title:             st.Metadata.DisplayTitle(),
+			Artist:            st.Metadata.Artist,
 		})
 	}
 	writeXML(w, http.StatusOK, xmlListMounts{Source: out})
@@ -562,6 +856,10 @@ func (s *Server) handleAdminKillSource(w http.ResponseWriter, r *http.Request) {
 	for m.Status().Source && time.Now().Before(deadline) {
 		time.Sleep(2 * time.Millisecond)
 	}
+	mCfg := m.Config()
+	if len(mCfg.Fallback) == 0 && mCfg.Relay == nil {
+		m.CloseListeners("source_killed")
+	}
 	writeXML(w, http.StatusOK, xmlIceResponse{
 		Message: "Source removed",
 		Return:  1,
@@ -583,7 +881,7 @@ type xspfPlaylist struct {
 	Version   string        `xml:"version,attr"`
 	XMLNS     string        `xml:"xmlns,attr"`
 	Title     string        `xml:"title"`
-	Creator   string        `xml:"creator"`
+	Creator   string        `xml:"creator,omitempty"`
 	TrackList xspfTrackList `xml:"trackList"`
 }
 
@@ -593,7 +891,7 @@ type xspfTrackList struct {
 
 type xspfTrack struct {
 	Location   string `xml:"location"`
-	Creator    string `xml:"creator"`
+	Creator    string `xml:"creator,omitempty"`
 	Title      string `xml:"title"`
 	Annotation string `xml:"annotation"`
 	Info       string `xml:"info,omitempty"`
@@ -629,7 +927,7 @@ func (s *Server) handleMountM3U(w http.ResponseWriter, r *http.Request, m *strea
 	if name == "" {
 		name = "Kite"
 	}
-	listenURL := requestBaseURL(r) + m.Config().Path
+	listenURL := s.requestBaseURL(r) + m.Config().Path
 	setCORS(w, m.Config().CORSOrigins, r.Header.Get("Origin"))
 	w.Header().Set("Content-Type", "audio/x-mpegurl; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-store")
@@ -647,11 +945,12 @@ func (s *Server) handleMountXSPF(w http.ResponseWriter, r *http.Request, m *stre
 	}
 	meta := m.StreamMetadata()
 	st := m.Status()
-	artist, trackTitle := splitArtistTitle(st.Metadata.Title)
+	trackTitle := st.Metadata.DisplayTitle()
 	if trackTitle == "" {
 		trackTitle = meta.Name
 	}
-	listenURL := requestBaseURL(r) + st.Path
+	artist := st.Metadata.Artist
+	listenURL := s.requestBaseURL(r) + st.Path
 	doc := xspfPlaylist{
 		Version: "1",
 		XMLNS:   "http://xspf.org/ns/0/",

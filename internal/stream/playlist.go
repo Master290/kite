@@ -150,6 +150,8 @@ func pumpPlaylist(ctx context.Context, files []string, shuffle bool, profile str
 	}
 	if bitrate <= 0 {
 		bitrate = 128000
+	} else if bitrate < 1000 {
+		bitrate *= 1000
 	}
 
 	playlist := make([]string, len(files))

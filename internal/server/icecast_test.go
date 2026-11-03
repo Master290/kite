@@ -6,13 +6,16 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Master290/kite/internal/config"
 	"github.com/Master290/kite/internal/stream"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func testMP3Frame() []byte {
@@ -21,9 +24,13 @@ func testMP3Frame() []byte {
 	return frame
 }
 
-// 1) Busy mount returns 403 Forbidden (not 409 Conflict).
+// 1) Busy mount returns 403 Forbidden (not 409 Conflict) and logs the rejected attempt.
 func TestBusyMountReturns403Forbidden(t *testing.T) {
+	var logBuf safeBuffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
 	s, ts := publicServer(t)
+	s.log = logger
 	m, _ := s.hub.Get("/radio")
 	acquireTestSource(t, m)
 
@@ -41,12 +48,17 @@ func TestBusyMountReturns403Forbidden(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("busy mount status=%d, want %d (403 Forbidden)", resp.StatusCode, http.StatusForbidden)
 	}
+	if !strings.Contains(logBuf.String(), "mount busy") || !strings.Contains(logBuf.String(), "/radio") {
+		t.Fatalf("expected 403 busy mount rejection log, got: %s", logBuf.String())
+	}
 }
 
 // 2) Read ice-name, ice-genre, ice-description, ice-url, ice-bitrate, ice-public
 // from the source request and use them as stream metadata unless overridden in config.
+// Also verify metadata is cleared when the source disconnects (ReleaseSource).
 func TestSourceIceHeadersAndConfigOverrides(t *testing.T) {
 	t.Setenv("ADMIN_TOKEN", "admin")
+	t.Setenv("ICECAST_ADMIN_PASSWORD", "icecast-admin")
 	t.Setenv("SOURCE_PASSWORD", "source")
 
 	yamlCfg := `
@@ -56,6 +68,7 @@ server:
 admin:
   address: "127.0.0.1:9090"
   token_env: ADMIN_TOKEN
+  icecast_admin_password_env: ICECAST_ADMIN_PASSWORD
 tls:
   mode: development
 mounts:
@@ -72,7 +85,7 @@ mounts:
       description: "Config Description"
       genre: "Config Genre"
       url: "https://config.example.com"
-      bitrate: 192
+      bitrate: 192000
       public: false
 `
 	parsed, err := config.Parse([]byte(yamlCfg), t.TempDir())
@@ -84,32 +97,55 @@ mounts:
 	})
 
 	frame := testMP3Frame()
-	for _, path := range []string{"/dynamic", "/overridden"} {
-		req, err := http.NewRequest(http.MethodPut, ts.URL+path, bytes.NewReader(frame))
-		if err != nil {
-			t.Fatal(err)
+	type activePut struct {
+		pw   *io.PipeWriter
+		done chan struct{}
+	}
+	var puts []activePut
+	defer func() {
+		for _, p := range puts {
+			_ = p.pw.Close()
+			<-p.done
 		}
-		req.SetBasicAuth("source", "source")
-		req.Header.Set("Content-Type", "audio/mpeg")
-		req.Header.Set("ice-name", "Source Stream Name")
-		req.Header.Set("ice-description", "Source Stream Description")
-		req.Header.Set("ice-genre", "Synthwave")
-		req.Header.Set("ice-url", "https://source.example.com")
-		req.Header.Set("ice-bitrate", "128")
-		req.Header.Set("ice-public", "1")
-		req.Header.Set("ice-audio-info", "ice-samplerate=44100;ice-bitrate=128;ice-channels=2")
+	}()
 
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
+	for _, path := range []string{"/dynamic", "/overridden"} {
+		pr, pw := io.Pipe()
+		done := make(chan struct{})
+		puts = append(puts, activePut{pw: pw, done: done})
+		go func(mountPath string) {
+			defer close(done)
+			req, err := http.NewRequest(http.MethodPut, ts.URL+mountPath, pr)
+			if err != nil {
+				return
+			}
+			req.SetBasicAuth("source", "source")
+			req.Header.Set("Content-Type", "audio/mpeg")
+			req.Header.Set("ice-name", "Source Stream Name")
+			req.Header.Set("ice-description", "Source Stream Description")
+			req.Header.Set("ice-genre", "Synthwave")
+			req.Header.Set("ice-url", "https://source.example.com")
+			req.Header.Set("ice-bitrate", "128")
+			req.Header.Set("ice-public", "1")
+			req.Header.Set("ice-audio-info", "ice-samplerate=44100;ice-bitrate=128;ice-channels=2")
+			resp, err := http.DefaultClient.Do(req)
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+		}(path)
+		_, _ = pw.Write(frame)
+
+		m, _ := s.hub.Get(path)
+		deadline := time.Now().Add(2 * time.Second)
+		for !m.Status().Source && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
 		}
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("PUT %s status=%d", path, resp.StatusCode)
+		if !m.Status().Source {
+			t.Fatalf("mount %s did not become active", path)
 		}
 	}
 
-	// Verify /dynamic uses the source's ice-* headers.
+	// Verify /dynamic uses the source's ice-* headers while connected.
 	headDyn, err := http.Head(ts.URL + "/dynamic")
 	if err != nil {
 		t.Fatal(err)
@@ -134,7 +170,7 @@ mounts:
 		t.Fatalf("dynamic icy-pub=%q", got)
 	}
 
-	// Verify /overridden keeps config values instead of source headers.
+	// Verify /overridden keeps config values (and normalizes 192000 bps -> 192 kbps).
 	headOvr, err := http.Head(ts.URL + "/overridden")
 	if err != nil {
 		t.Fatal(err)
@@ -153,7 +189,7 @@ mounts:
 		t.Fatalf("overridden icy-url=%q", got)
 	}
 	if got := headOvr.Header.Get("icy-br"); got != "192" {
-		t.Fatalf("overridden icy-br=%q", got)
+		t.Fatalf("overridden icy-br=%q, want 192 (normalized kbps)", got)
 	}
 	if got := headOvr.Header.Get("icy-pub"); got != "0" {
 		t.Fatalf("overridden icy-pub=%q, want 0 (config public: false)", got)
@@ -163,9 +199,18 @@ mounts:
 	if meta := mDyn.StreamMetadata(); !meta.Public || meta.Bitrate != 128 || meta.Name != "Source Stream Name" {
 		t.Fatalf("dynamic StreamMetadata=%+v", meta)
 	}
-	mOvr, _ := s.hub.Get("/overridden")
-	if meta := mOvr.StreamMetadata(); meta.Public || meta.Bitrate != 192 || meta.Name != "Config Name" {
-		t.Fatalf("overridden StreamMetadata=%+v", meta)
+	if mDyn.SourceIP() == "" {
+		t.Fatal("expected non-empty SourceIP while source is connected")
+	}
+
+	// Disconnect /dynamic source and verify stale source metadata is cleared on ReleaseSource.
+	_ = puts[0].pw.Close()
+	<-puts[0].done
+	if meta := mDyn.StreamMetadata(); meta.Name != "" || meta.Genre != "" || meta.Bitrate != 0 || meta.Public {
+		t.Fatalf("expected dynamic StreamMetadata to be cleared after source release, got %+v", meta)
+	}
+	if ip := mDyn.SourceIP(); ip != "" {
+		t.Fatalf("expected empty SourceIP after source release, got %q", ip)
 	}
 }
 
@@ -209,10 +254,13 @@ func TestHTTPListenerBurstOnConnect(t *testing.T) {
 	}
 }
 
-// 4) /status-json.xsl matches Icecast 2.4 schema (object for 1 mount, array for multiple mounts),
-// while /api/v1 remains unchanged.
+// 4) /status-json.xsl matches Icecast 2.4 schema:
+// - omitted "source" when 0 live public mounts
+// - object when 1 live public mount
+// - array when 2+ live public mounts
+// - song= keeps full "Artist - Title" in title and omits artist; explicit artist= emits artist
+// - /api/v1 remains unchanged.
 func TestStatusJSONMatchesIcecast24Schema(t *testing.T) {
-	// Sample Icecast 2.4 single-mount JSON response for structural comparison.
 	const sampleIcecastSingleJSON = `{
 		"icestats": {
 			"admin": "icemaster@localhost",
@@ -233,8 +281,7 @@ func TestStatusJSONMatchesIcecast24Schema(t *testing.T) {
 				"server_type": "audio/mpeg",
 				"stream_start": "Mon, 03 Nov 2026 20:00:00 +0000",
 				"stream_start_iso8601": "2026-11-03T20:00:00+0000",
-				"title": "One More Time",
-				"artist": "Daft Punk"
+				"title": "Daft Punk - One More Time"
 			}
 		}
 	}`
@@ -247,17 +294,33 @@ func TestStatusJSONMatchesIcecast24Schema(t *testing.T) {
 	sampleSource := sampleStats["source"].(map[string]any)
 
 	s, ts := publicServer(t)
+
+	// 4a) With 0 live sources (all mounts offline), "source" must be omitted entirely.
+	resp0, err := http.Get(ts.URL + "/status-json.xsl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotZero map[string]any
+	if err := json.NewDecoder(resp0.Body).Decode(&gotZero); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp0.Body.Close()
+	zeroStats := gotZero["icestats"].(map[string]any)
+	if _, hasSource := zeroStats["source"]; hasSource {
+		t.Fatalf("expected 'source' key to be omitted when no mounts have a live source, got %+v", zeroStats["source"])
+	}
+
+	// 4b) Activate 1 live public mount with song= metadata (not split; artist omitted).
 	m, _ := s.hub.Get("/radio")
 	acquireTestSource(t, m)
 	m.SetSourceStreamMetadata(stream.SourceStreamMetadata{
 		Description: "Main Station",
 		Genre:       "Electronic",
-		Bitrate:     128,
-		AudioInfo:   "ice-samplerate=44100;ice-bitrate=128;ice-channels=2",
+		Bitrate:     128000, // bps normalized to 128 kbps
+		AudioInfo:   "ice-samplerate=44100;ice-bitrate=128000;ice-channels=2",
 	})
 	m.SetMetadata(stream.Metadata{Title: "Daft Punk - One More Time"})
 
-	// Connect one listener to populate listeners and listener_peak.
 	lCtx, lCancel := context.WithCancel(context.Background())
 	defer lCancel()
 	lReq, _ := http.NewRequestWithContext(lCtx, http.MethodGet, ts.URL+"/radio", nil)
@@ -278,48 +341,75 @@ func TestStatusJSONMatchesIcecast24Schema(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&gotMap); err != nil {
 		t.Fatal(err)
 	}
-	gotStats, ok := gotMap["icestats"].(map[string]any)
-	if !ok {
-		t.Fatalf("missing icestats object: %+v", gotMap)
-	}
+	gotStats := gotMap["icestats"].(map[string]any)
 	for k := range sampleStats {
 		if _, exists := gotStats[k]; !exists {
 			t.Fatalf("icestats missing required key %q in %+v", k, gotStats)
 		}
 	}
-	// With 1 visible mount, source MUST be a JSON object, not an array.
 	gotSource, ok := gotStats["source"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected source to be a JSON object when 1 mount exists, got %T (%+v)", gotStats["source"], gotStats["source"])
+		t.Fatalf("expected source to be a JSON object when 1 live mount exists, got %T (%+v)", gotStats["source"], gotStats["source"])
 	}
 	for k := range sampleSource {
 		if _, exists := gotSource[k]; !exists {
 			t.Fatalf("source object missing required Icecast 2.4 key %q in %+v", k, gotSource)
 		}
 	}
+	if _, hasArtist := gotSource["artist"]; hasArtist {
+		t.Fatalf("expected artist to be omitted when metadata came from song=, got %q", gotSource["artist"])
+	}
 	if gotSource["server_name"] != "Kite Test" ||
 		gotSource["server_description"] != "Main Station" ||
 		gotSource["server_type"] != "audio/mpeg" ||
 		gotSource["genre"] != "Electronic" ||
 		gotSource["bitrate"] != float64(128) ||
-		gotSource["artist"] != "Daft Punk" ||
-		gotSource["title"] != "One More Time" ||
+		gotSource["title"] != "Daft Punk - One More Time" ||
 		gotSource["listeners"] != float64(1) ||
 		gotSource["listener_peak"] != float64(1) ||
 		gotSource["audio_info"] != "ice-samplerate=44100;ice-bitrate=128;ice-channels=2" {
 		t.Fatalf("unexpected source fields: %+v", gotSource)
 	}
 
-	// Now add a second visible mount and verify source becomes a JSON array.
+	// Verify explicit artist + title sets both artist and title.
+	m.SetMetadata(stream.Metadata{Artist: "Daft Punk", Song: "One More Time"})
+	respExplicit, err := http.Get(ts.URL + "/status-json.xsl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotExplicit map[string]any
+	_ = json.NewDecoder(respExplicit.Body).Decode(&gotExplicit)
+	_ = respExplicit.Body.Close()
+	srcExplicit := gotExplicit["icestats"].(map[string]any)["source"].(map[string]any)
+	if srcExplicit["artist"] != "Daft Punk" || srcExplicit["title"] != "One More Time" {
+		t.Fatalf("explicit artist/title mismatch: %+v", srcExplicit)
+	}
+
+	// 4c) Add a second public mount: while offline, source must STILL be a single object.
 	cfg := s.Config()
 	cfg.Mounts = append(cfg.Mounts, config.Mount{
 		Path:        "/jazz",
 		Profile:     "mp3",
 		ContentType: "audio/mpeg",
 		Source:      cfg.Mounts[0].Source,
-		Metadata:    config.Metadata{Name: "Jazz Channel", Genre: "Jazz", Bitrate: 160, Public: true},
+		Metadata:    config.Metadata{Name: "Jazz Channel", Genre: "Jazz", Bitrate: 160000, Public: true},
 	})
 	s.applyConfig(cfg)
+
+	respOffline2, err := http.Get(ts.URL + "/status-json.xsl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotStillOne map[string]any
+	_ = json.NewDecoder(respOffline2.Body).Decode(&gotStillOne)
+	_ = respOffline2.Body.Close()
+	if _, ok := gotStillOne["icestats"].(map[string]any)["source"].(map[string]any); !ok {
+		t.Fatalf("expected offline mount /jazz to be excluded from status-json, got %T", gotStillOne["icestats"].(map[string]any)["source"])
+	}
+
+	// Now connect a live source to /jazz and verify source becomes a 2-element array.
+	mJazz, _ := s.hub.Get("/jazz")
+	acquireTestSource(t, mJazz)
 
 	resp2, err := http.Get(ts.URL + "/status-json.xsl")
 	if err != nil {
@@ -334,7 +424,7 @@ func TestStatusJSONMatchesIcecast24Schema(t *testing.T) {
 	multiStats := gotMulti["icestats"].(map[string]any)
 	multiSources, ok := multiStats["source"].([]any)
 	if !ok || len(multiSources) != 2 {
-		t.Fatalf("expected source to be a 2-element array when 2 mounts exist, got %T (%+v)", multiStats["source"], multiStats["source"])
+		t.Fatalf("expected source to be a 2-element array when 2 live mounts exist, got %T (%+v)", multiStats["source"], multiStats["source"])
 	}
 
 	// Verify /api/v1/mounts remains unchanged.
@@ -357,9 +447,8 @@ func TestStatusJSONMatchesIcecast24Schema(t *testing.T) {
 }
 
 // 5) XML /admin/stats, /admin/listmounts, /admin/listclients?mount=,
-// /admin/killclient?mount=&id=, /admin/killsource?mount= with admin Basic auth.
+// /admin/killclient?mount=&id=, /admin/killsource?mount= with separate Icecast admin Basic auth.
 func TestIcecastAdminXMLEndpoints(t *testing.T) {
-	// Sample Icecast 2.4 XML responses to compare structure against.
 	const (
 		sampleAdminStatsXML = `<?xml version="1.0"?>
 <icestats>
@@ -370,7 +459,7 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
   <listeners>1</listeners>
   <location>Earth</location>
   <server_id>Icecast 2.4.4</server_id>
-  <sources>2</sources>
+  <sources>1</sources>
   <source mount="/radio">
     <bitrate>128</bitrate>
     <genre>Rock</genre>
@@ -381,8 +470,7 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
     <server_description>Rock Desc</server_description>
     <server_name>Kite Test</server_name>
     <server_type>audio/mpeg</server_type>
-    <title>Track</title>
-    <artist>Band</artist>
+    <title>Band - Track</title>
   </source>
 </icestats>`
 		sampleListMountsXML = `<?xml version="1.0"?>
@@ -412,7 +500,6 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
 </iceresponse>`
 	)
 
-	// Ensure sample Icecast XML documents unmarshal into the same schemas.
 	var statsSample xmlIceStats
 	if err := xml.Unmarshal([]byte(sampleAdminStatsXML), &statsSample); err != nil {
 		t.Fatal(err)
@@ -432,7 +519,7 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
 
 	s, ts := publicServer(t)
 
-	// Verify all 5 endpoints require admin Basic auth.
+	// Verify all 5 endpoints require Icecast admin Basic auth.
 	for _, ep := range []string{
 		"/admin/stats",
 		"/admin/listmounts",
@@ -451,6 +538,8 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
 		if !strings.HasPrefix(unauthResp.Header.Get("WWW-Authenticate"), "Basic ") {
 			t.Fatalf("GET %s WWW-Authenticate=%q", ep, unauthResp.Header.Get("WWW-Authenticate"))
 		}
+		// Reset limiter after checking unauthenticated requests.
+		s.getAuthLimiter().recordSuccess("127.0.0.1")
 	}
 
 	// Start a live HTTP PUT source that stays open until killed via /admin/killsource.
@@ -500,7 +589,7 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		req.SetBasicAuth("admin", "admin")
+		req.SetBasicAuth("admin", "icecast-admin")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -518,21 +607,26 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
 		}
 	}
 
-	// 5a) /admin/stats
+	// 5a) /admin/stats: <sources> must count only live sources (1, not 2), and offline /private must have <connected>0</connected>.
 	var gotStats xmlIceStats
 	doAdminXML("/admin/stats", &gotStats)
-	if gotStats.ServerID != statsSample.ServerID || gotStats.Listeners != 1 || len(gotStats.Source) == 0 {
+	if gotStats.ServerID != statsSample.ServerID || gotStats.Listeners != 1 || gotStats.Sources != 1 {
 		t.Fatalf("/admin/stats unexpected: %+v", gotStats)
 	}
-	var radioStats *xmlStatsSource
+	var radioStats, privStats *xmlStatsSource
 	for i := range gotStats.Source {
-		if gotStats.Source[i].Mount == "/radio" {
+		switch gotStats.Source[i].Mount {
+		case "/radio":
 			radioStats = &gotStats.Source[i]
-			break
+		case "/private":
+			privStats = &gotStats.Source[i]
 		}
 	}
-	if radioStats == nil || radioStats.Genre != "Rock" || radioStats.Bitrate != 128 || radioStats.Artist != "Band" || radioStats.Title != "Track" || radioStats.Listeners != 1 {
+	if radioStats == nil || radioStats.Genre != "Rock" || radioStats.Bitrate != 128 || radioStats.Artist != "" || radioStats.Title != "Band - Track" || radioStats.Listeners != 1 {
 		t.Fatalf("/admin/stats /radio=%+v", radioStats)
+	}
+	if privStats == nil || privStats.Connected != 0 || privStats.SourceIP != "" {
+		t.Fatalf("/admin/stats offline /private=%+v", privStats)
 	}
 
 	// 5b) /admin/listmounts
@@ -565,6 +659,17 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
 		t.Fatalf("expected 0 clients after killclient, got %+v", afterKillClients)
 	}
 
+	// Connect a second listener before /admin/killsource to verify killsource disconnects listeners when no fallback is configured.
+	lCtx2, lCancel2 := context.WithCancel(context.Background())
+	defer lCancel2()
+	lReq2, _ := http.NewRequestWithContext(lCtx2, http.MethodGet, ts.URL+"/radio", nil)
+	lResp2, err := http.DefaultClient.Do(lReq2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lResp2.Body.Close()
+	waitForListeners(t, s, "/radio", 1)
+
 	// 5e) /admin/killsource?mount=/radio
 	var killSourceResp xmlIceResponse
 	doAdminXML("/admin/killsource?mount=/radio", &killSourceResp)
@@ -574,6 +679,7 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
 	if m.Status().Source {
 		t.Fatal("expected source to be disconnected after /admin/killsource")
 	}
+	waitForListeners(t, s, "/radio", 0)
 	select {
 	case <-sourceDone:
 	case <-time.After(time.Second):
@@ -581,17 +687,15 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
 	}
 }
 
-// 6) Serve /<mount>.m3u and /<mount>.xspf playlists.
+// 6) Serve /<mount>.m3u and /<mount>.xspf playlists, including public_url / hostname and trusted_proxies.
 func TestMountM3UAndXSPFPlaylists(t *testing.T) {
 	const sampleXSPF = `<?xml version="1.0" encoding="UTF-8"?>
 <playlist xmlns="http://xspf.org/ns/0/" version="1">
   <title>Kite Test</title>
-  <creator>Artist</creator>
   <trackList>
     <track>
       <location>http://localhost:8000/radio</location>
-      <creator>Artist</creator>
-      <title>Song</title>
+      <title>Artist - Song</title>
       <annotation>Station Desc</annotation>
       <info>https://radio.example</info>
     </track>
@@ -605,6 +709,7 @@ func TestMountM3UAndXSPFPlaylists(t *testing.T) {
 
 	s, ts := publicServer(t)
 	m, _ := s.hub.Get("/radio")
+	acquireTestSource(t, m)
 	m.SetSourceStreamMetadata(stream.SourceStreamMetadata{
 		Description: "Station Desc",
 		URL:         "https://radio.example",
@@ -628,7 +733,7 @@ func TestMountM3UAndXSPFPlaylists(t *testing.T) {
 		t.Fatalf("/radio.m3u body=%q", string(m3uBody))
 	}
 
-	// Test /radio.xspf
+	// Test /radio.xspf (song= is not split; creator is omitted unless artist was set explicitly)
 	xspfResp, err := http.Get(ts.URL + "/radio.xspf")
 	if err != nil {
 		t.Fatal(err)
@@ -646,13 +751,47 @@ func TestMountM3UAndXSPFPlaylists(t *testing.T) {
 	}
 	if gotXSPF.Version != wantXSPF.Version ||
 		gotXSPF.Title != wantXSPF.Title ||
+		gotXSPF.Creator != "" ||
 		len(gotXSPF.TrackList.Track) != 1 ||
 		gotXSPF.TrackList.Track[0].Location != ts.URL+"/radio" ||
-		gotXSPF.TrackList.Track[0].Creator != wantXSPF.TrackList.Track[0].Creator ||
+		gotXSPF.TrackList.Track[0].Creator != "" ||
 		gotXSPF.TrackList.Track[0].Title != wantXSPF.TrackList.Track[0].Title ||
 		gotXSPF.TrackList.Track[0].Annotation != wantXSPF.TrackList.Track[0].Annotation ||
 		gotXSPF.TrackList.Track[0].Info != wantXSPF.TrackList.Track[0].Info {
 		t.Fatalf("/radio.xspf parsed=%+v, want=%+v", gotXSPF, wantXSPF)
+	}
+
+	// Test configured hostname & trusted_proxies X-Forwarded-Proto / X-Forwarded-Host.
+	cfg := s.Config()
+	cfg.Server.Hostname = "stream.configured.example:8000"
+	s.applyConfig(cfg)
+
+	reqUntrusted, _ := http.NewRequest(http.MethodGet, ts.URL+"/radio.m3u", nil)
+	reqUntrusted.Header.Set("X-Forwarded-Proto", "https")
+	reqUntrusted.Header.Set("X-Forwarded-Host", "evil.example.com")
+	respUntrusted, err := http.DefaultClient.Do(reqUntrusted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyUntrusted, _ := io.ReadAll(respUntrusted.Body)
+	_ = respUntrusted.Body.Close()
+	if !strings.Contains(string(bodyUntrusted), "http://stream.configured.example:8000/radio\n") {
+		t.Fatalf("expected configured hostname when proxy is untrusted, got %q", string(bodyUntrusted))
+	}
+
+	cfg.Server.TrustedProxies = []string{"127.0.0.1/32", "::1/128"}
+	s.applyConfig(cfg)
+	reqTrusted, _ := http.NewRequest(http.MethodGet, ts.URL+"/radio.m3u", nil)
+	reqTrusted.Header.Set("X-Forwarded-Proto", "https")
+	reqTrusted.Header.Set("X-Forwarded-Host", "edge.radio.example")
+	respTrusted, err := http.DefaultClient.Do(reqTrusted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyTrusted, _ := io.ReadAll(respTrusted.Body)
+	_ = respTrusted.Body.Close()
+	if !strings.Contains(string(bodyTrusted), "https://edge.radio.example/radio\n") {
+		t.Fatalf("expected X-Forwarded-Proto/Host when behind trusted proxy, got %q", string(bodyTrusted))
 	}
 
 	// Unknown mount playlists return 404.
@@ -666,6 +805,331 @@ func TestMountM3UAndXSPFPlaylists(t *testing.T) {
 			t.Fatalf("GET %s status=%d, want 404", missing, r404.StatusCode)
 		}
 	}
+}
+
+// 7) Auth separation (Icecast admin password vs Bearer admin API token), per-IP lockout,
+// pre-bcrypt rate limiting, and redacted logging.
+func TestAuthSeparationAndLockout(t *testing.T) {
+	var logBuf safeBuffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	hash, err := bcrypt.GenerateFromPassword([]byte("source-secret"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, ts := publicServer(t, func(cfg *config.Config) {
+		cfg.Mounts[0].Source = config.SourceCredential{
+			Username:       "source",
+			PasswordBcrypt: string(hash),
+		}
+	})
+	s.log = logger
+
+	nowMu := sync.Mutex{}
+	fakeNow := time.Now()
+	limiter := s.getAuthLimiter()
+	limiter.baseDelay = 5 * time.Second
+	limiter.nowFn = func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return fakeNow
+	}
+	advanceTime := func(d time.Duration) {
+		nowMu.Lock()
+		fakeNow = fakeNow.Add(d)
+		nowMu.Unlock()
+	}
+
+	// 7a) Bearer admin API token ("admin") MUST NOT be accepted on /admin/stats.
+	reqBearerAsBasic, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+	reqBearerAsBasic.SetBasicAuth("admin", "admin")
+	resp, err := http.DefaultClient.Do(reqBearerAsBasic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Bearer admin token must be rejected on /admin/stats, got status=%d", resp.StatusCode)
+	}
+	limiter.recordSuccess("127.0.0.1")
+
+	// 7b) 5 failed attempts on /admin/stats return 401; 6th attempt returns 429 even with valid password.
+	for i := 1; i <= 5; i++ {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+		req.SetBasicAuth("admin", "wrong-secret-pass")
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = r.Body.Close()
+		if r.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("attempt %d status=%d, want 401", i, r.StatusCode)
+		}
+	}
+
+	// 6th attempt with the CORRECT password while locked out must still return 429 Too Many Requests.
+	reqLocked, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+	reqLocked.SetBasicAuth("admin", "icecast-admin")
+	respLocked, err := http.DefaultClient.Do(reqLocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respLocked.Body.Close()
+	if respLocked.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("locked out attempt status=%d, want 429", respLocked.StatusCode)
+	}
+	if respLocked.Header.Get("Retry-After") == "" {
+		t.Fatal("expected Retry-After header on 429 lockout response")
+	}
+
+	// Advance clock past the 5s initial lockout window; valid password now succeeds.
+	advanceTime(6 * time.Second)
+	reqOK, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+	reqOK.SetBasicAuth("admin", "icecast-admin")
+	respOK, err := http.DefaultClient.Do(reqOK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respOK.Body.Close()
+	if respOK.StatusCode != http.StatusOK {
+		t.Fatalf("after lockout expiry status=%d, want 200", respOK.StatusCode)
+	}
+
+	// 7c) Source auth (with bcrypt) also locks out after 5 failures and logs redacted credentials.
+	for i := 1; i <= 5; i++ {
+		req, _ := http.NewRequest(http.MethodPut, ts.URL+"/radio", bytes.NewReader(testMP3Frame()))
+		req.SetBasicAuth("source", "bad-source-pass")
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = r.Body.Close()
+		if r.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("source attempt %d status=%d, want 401", i, r.StatusCode)
+		}
+	}
+	reqSourceLocked, _ := http.NewRequest(http.MethodPut, ts.URL+"/radio", bytes.NewReader(testMP3Frame()))
+	reqSourceLocked.SetBasicAuth("source", "source-secret")
+	respSourceLocked, err := http.DefaultClient.Do(reqSourceLocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respSourceLocked.Body.Close()
+	if respSourceLocked.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("locked out source attempt status=%d, want 429", respSourceLocked.StatusCode)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] in auth failure logs, got: %s", logs)
+	}
+	if strings.Contains(logs, "wrong-secret-pass") || strings.Contains(logs, "bad-source-pass") {
+		t.Fatalf("auth failure logs leaked plaintext password: %s", logs)
+	}
+}
+
+// 8) Write coalescing at the live edge: frames arriving within write_interval are batched, not written per-frame.
+func TestWriteCoalescingAtLiveEdge(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.HTTPAddress = "127.0.0.1:8000"
+	cfg.Defaults.WriteInterval = config.Duration(80 * time.Millisecond)
+	cfg.Mounts = []config.Mount{
+		{
+			Path:        "/radio",
+			Profile:     "mp3",
+			ContentType: "audio/mpeg",
+			Source:      config.SourceCredential{Username: "source", PasswordBcrypt: "$2a$10$abcdefghijklmnopqrstuv"},
+			BurstBytes:  417 * 10,
+		},
+	}
+	if err := cfg.Normalize(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	h, err := stream.NewHub(&cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	m, _ := h.Get("/radio")
+	if err := m.AcquireSource(); err != nil {
+		t.Fatal(err)
+	}
+	defer m.ReleaseSource()
+
+	sub := m.Subscribe("http")
+	defer sub.Close("done")
+
+	cw := &countingWriter{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- stream.Copy(ctx, cw, sub)
+	}()
+
+	// Write 8 live MP3 frames (8 * 417 = 3,336 bytes < 4,096 threshold) spaced 5ms apart (40ms total < 80ms write_interval).
+	frame := testMP3Frame()
+	for i := 0; i < 8; i++ {
+		if err := m.Write(frame); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Wait for the 80ms write_interval flush to deliver all 3,336 bytes.
+	deadline := time.Now().Add(time.Second)
+	for cw.TotalBytes() < 8*len(frame) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if cw.TotalBytes() != 8*len(frame) {
+		t.Fatalf("total bytes=%d, want %d", cw.TotalBytes(), 8*len(frame))
+	}
+	// All 8 frames arrived within a single 80ms write_interval and under 4KB, so they must be coalesced into 1-2 writes, not 8.
+	if writes := cw.WriteCount(); writes > 2 {
+		t.Fatalf("live-edge frames were not coalesced: got %d Write calls for 8 frames, want <= 2", writes)
+	}
+}
+
+// 9) ICY zero-length metadata block when title hasn't changed, and JSON config public:false via Admin API.
+func TestICYZeroLengthUnchangedBlockAndJSONConfigPublicFalse(t *testing.T) {
+	s, ts := publicServer(t, func(cfg *config.Config) {
+		def := config.Default()
+		cfg.Version = def.Version
+		cfg.Server = def.Server
+		cfg.TLS = def.TLS
+	})
+	m, _ := s.hub.Get("/radio")
+	acquireTestSource(t, m)
+	m.SetMetadata(stream.Metadata{Title: "Same Track"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/radio", nil)
+	req.Header.Set("Icy-MetaData", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	waitForListeners(t, s, "/radio", 1)
+
+	// metaint is 256 bytes. Write 2 * 256 = 512 bytes with unchanged title.
+	payload := bytes.Repeat([]byte{0xAA}, 512)
+	if err := m.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	firstBlock := stream.FormatICYMetadataBlock("Same Track")
+	// Expect: 256 audio bytes + firstBlock (non-empty) + 256 audio bytes + 0x00 (1-byte zero-length block).
+	wantLen := 256 + len(firstBlock) + 256 + 1
+	buf := readBodyBytes(t, resp.Body, wantLen, 2*time.Second)
+	if buf[256] == 0 {
+		t.Fatal("first metadata block should contain the initial title, got length 0")
+	}
+	secondLenByteOffset := 256 + len(firstBlock) + 256
+	if buf[secondLenByteOffset] != 0 {
+		t.Fatalf("second metadata block with unchanged title should be 0x00, got length byte %d", buf[secondLenByteOffset])
+	}
+
+	// Verify JSON config via PUT /api/v1/config can force public:false (setting PublicSet=true).
+	adminMux := http.NewServeMux()
+	s.registerAdmin(adminMux)
+	jsonBody := `{
+		"version": 1,
+		"server": {"https_address": ":8443", "http3_address": ":8443", "public_https_port": 8443},
+		"admin": {"address": "127.0.0.1:9090", "token_env": "ADMIN_TOKEN", "icecast_admin_password_env": "ICECAST_ADMIN_PASSWORD"},
+		"tls": {"mode": "development"},
+		"mounts": [
+			{
+				"path": "/radio",
+				"profile": "mp3",
+				"source": {"username": "source", "password_env": "SOURCE_PASSWORD"},
+				"metadata": {"name": "JSON Private", "bitrate": 128000, "public": false}
+			}
+		]
+	}`
+	// Align static fields with current config so Commit does not require restart.
+	var cfgDoc config.Config
+	if err := json.Unmarshal([]byte(jsonBody), &cfgDoc); err != nil {
+		t.Fatal(err)
+	}
+	if !cfgDoc.Mounts[0].Metadata.PublicSet || cfgDoc.Mounts[0].Metadata.Public {
+		t.Fatalf("JSON Unmarshal did not set PublicSet=true with Public=false: %+v", cfgDoc.Mounts[0].Metadata)
+	}
+	cur := *s.Config()
+	cur.Mounts[0].Metadata = cfgDoc.Mounts[0].Metadata
+	rawJSON, err := json.Marshal(cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	putReq := newTestRequest(http.MethodPut, "http://admin/api/v1/config", bytes.NewReader(rawJSON))
+	putReq.Header.Set("Authorization", "Bearer admin")
+	putRec := newTestRecorder()
+	adminMux.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("PUT /api/v1/config status=%d body=%s", putRec.Code, putRec.Body.String())
+	}
+
+	mAfter, _ := s.hub.Get("/radio")
+	mAfter.SetSourceStreamMetadata(stream.SourceStreamMetadata{Public: true, PublicSet: true})
+	if mAfter.StreamMetadata().Public {
+		t.Fatal("expected JSON config public:false to override source ice-public:1")
+	}
+}
+
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+type countingWriter struct {
+	mu     sync.Mutex
+	writes int
+	bytes  int
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.writes++
+	w.bytes += len(p)
+	return len(p), nil
+}
+
+func (w *countingWriter) WriteCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writes
+}
+
+func (w *countingWriter) TotalBytes() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.bytes
+}
+
+func newTestRequest(method, target string, body io.Reader) *http.Request {
+	req, err := http.NewRequest(method, target, body)
+	if err != nil {
+		panic(err)
+	}
+	return req
 }
 
 func itoa(v int) string {

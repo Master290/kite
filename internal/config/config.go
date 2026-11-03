@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +34,28 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 
 func (d Duration) MarshalYAML() (any, error) { return time.Duration(d).String(), nil }
 
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
+}
+
+func (d *Duration) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		v, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("invalid duration %q: %w", s, err)
+		}
+		*d = Duration(v)
+		return nil
+	}
+	var ns int64
+	if err := json.Unmarshal(data, &ns); err == nil {
+		*d = Duration(ns)
+		return nil
+	}
+	return fmt.Errorf("invalid duration %s", string(data))
+}
+
 type Config struct {
 	Version  int      `yaml:"version" json:"version"`
 	Server   Server   `yaml:"server" json:"server"`
@@ -46,6 +70,8 @@ type Server struct {
 	HTTPSAddress         string   `yaml:"https_address,omitempty" json:"https_address,omitempty"`
 	HTTP3Address         string   `yaml:"http3_address,omitempty" json:"http3_address,omitempty"`
 	PublicHTTPSPort      int      `yaml:"public_https_port,omitempty" json:"public_https_port,omitempty"`
+	PublicURL            string   `yaml:"public_url,omitempty" json:"public_url,omitempty"`
+	Hostname             string   `yaml:"hostname,omitempty" json:"hostname,omitempty"`
 	ReadHeaderTimeout    Duration `yaml:"read_header_timeout" json:"read_header_timeout"`
 	IdleTimeout          Duration `yaml:"idle_timeout" json:"idle_timeout"`
 	ShutdownTimeout      Duration `yaml:"shutdown_timeout" json:"shutdown_timeout"`
@@ -53,7 +79,10 @@ type Server struct {
 	MaxHeaderBytes       int      `yaml:"max_header_bytes" json:"max_header_bytes"`
 	HLSEnabled           *bool    `yaml:"hls_enabled,omitempty" json:"hls_enabled,omitempty"`
 	StatusPageEnabled    *bool    `yaml:"status_page_enabled,omitempty" json:"status_page_enabled,omitempty"`
+	TrustedProxies       []string `yaml:"trusted_proxies,omitempty" json:"trusted_proxies,omitempty"`
 	TrustedProxyNetworks []string `yaml:"trusted_proxy_networks,omitempty" json:"trusted_proxy_networks,omitempty"`
+	IcecastAdminUser     string   `yaml:"icecast_admin_user,omitempty" json:"icecast_admin_user,omitempty"`
+	IcecastAdminPassword string   `yaml:"icecast_admin_password,omitempty" json:"icecast_admin_password,omitempty"`
 }
 
 // HLS reports whether `.m3u8` playlists and TS segments are served. It
@@ -65,9 +94,13 @@ func (s Server) HLS() bool { return s.HLSEnabled == nil || *s.HLSEnabled }
 func (s Server) StatusPage() bool { return s.StatusPageEnabled == nil || *s.StatusPageEnabled }
 
 type Admin struct {
-	Address   string `yaml:"address" json:"address"`
-	TokenEnv  string `yaml:"token_env,omitempty" json:"token_env,omitempty"`
-	TokenFile string `yaml:"token_file,omitempty" json:"token_file,omitempty"`
+	Address                  string `yaml:"address" json:"address"`
+	TokenEnv                 string `yaml:"token_env,omitempty" json:"token_env,omitempty"`
+	TokenFile                string `yaml:"token_file,omitempty" json:"token_file,omitempty"`
+	IcecastAdminUser         string `yaml:"icecast_admin_user,omitempty" json:"icecast_admin_user,omitempty"`
+	IcecastAdminPassword     string `yaml:"icecast_admin_password,omitempty" json:"icecast_admin_password,omitempty"`
+	IcecastAdminPasswordEnv  string `yaml:"icecast_admin_password_env,omitempty" json:"icecast_admin_password_env,omitempty"`
+	IcecastAdminPasswordFile string `yaml:"icecast_admin_password_file,omitempty" json:"icecast_admin_password_file,omitempty"`
 }
 
 type TLS struct {
@@ -161,6 +194,110 @@ func (m *Metadata) UnmarshalYAML(node *yaml.Node) error {
 	}
 	*m = Metadata(raw)
 	return nil
+}
+
+func (m Metadata) MarshalYAML() (any, error) {
+	node := &yaml.Node{Kind: yaml.MappingNode}
+	addStr := func(k, v string) {
+		if v != "" {
+			node.Content = append(node.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k},
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v},
+			)
+		}
+	}
+	addStr("name", m.Name)
+	addStr("description", m.Description)
+	addStr("genre", m.Genre)
+	addStr("url", m.URL)
+	if m.Bitrate != 0 {
+		node.Content = append(node.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "bitrate"},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.Itoa(m.Bitrate)},
+		)
+	}
+	if m.Public || m.PublicSet {
+		val := "false"
+		if m.Public {
+			val = "true"
+		}
+		node.Content = append(node.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "public"},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: val},
+		)
+	}
+	return node, nil
+}
+
+func (m *Metadata) UnmarshalJSON(data []byte) error {
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawMap); err != nil {
+		return err
+	}
+	for k := range rawMap {
+		switch k {
+		case "name", "description", "genre", "url", "bitrate", "public":
+		default:
+			return fmt.Errorf("unknown metadata field %q", k)
+		}
+	}
+	type rawMetadata Metadata
+	var raw rawMetadata
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if _, ok := rawMap["public"]; ok {
+		raw.PublicSet = true
+	}
+	*m = Metadata(raw)
+	return nil
+}
+
+func (m Metadata) MarshalJSON() ([]byte, error) {
+	out := make(map[string]any, 6)
+	if m.Name != "" {
+		out["name"] = m.Name
+	}
+	if m.Description != "" {
+		out["description"] = m.Description
+	}
+	if m.Genre != "" {
+		out["genre"] = m.Genre
+	}
+	if m.URL != "" {
+		out["url"] = m.URL
+	}
+	if m.Bitrate != 0 {
+		out["bitrate"] = m.Bitrate
+	}
+	if m.Public || m.PublicSet {
+		out["public"] = m.Public
+	}
+	return json.Marshal(out)
+}
+
+// NormalizeBitrateKbps converts a bitrate value to kbps. Values >= 1000 are
+// treated as bps (e.g. 128000 -> 128) for backward compatibility.
+func NormalizeBitrateKbps(v int) int {
+	if v <= 0 {
+		return 0
+	}
+	if v >= 1000 {
+		return v / 1000
+	}
+	return v
+}
+
+// NormalizeBitrateBps converts a bitrate value to bps. Values < 1000 are
+// treated as kbps (e.g. 128 -> 128000).
+func NormalizeBitrateBps(v int) int {
+	if v <= 0 {
+		return 0
+	}
+	if v < 1000 {
+		return v * 1000
+	}
+	return v
 }
 
 type Fallback struct {
@@ -258,6 +395,32 @@ func (c *Config) Normalize(baseDir string) error {
 	}
 	if c.Admin.TokenFile != "" {
 		c.Admin.TokenFile = absolute(baseDir, c.Admin.TokenFile)
+	}
+	if c.Admin.IcecastAdminUser == "" && c.Server.IcecastAdminUser != "" {
+		c.Admin.IcecastAdminUser = c.Server.IcecastAdminUser
+	}
+	if c.Admin.IcecastAdminUser == "" {
+		c.Admin.IcecastAdminUser = "admin"
+	}
+	if c.Admin.IcecastAdminPassword == "" && c.Server.IcecastAdminPassword != "" {
+		c.Admin.IcecastAdminPassword = c.Server.IcecastAdminPassword
+	}
+	if c.Admin.IcecastAdminPasswordFile != "" {
+		c.Admin.IcecastAdminPasswordFile = absolute(baseDir, c.Admin.IcecastAdminPasswordFile)
+	}
+	if c.Server.PublicURL != "" {
+		u, err := url.Parse(c.Server.PublicURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("invalid server.public_url %q", c.Server.PublicURL)
+		}
+		c.Server.PublicURL = strings.TrimRight(c.Server.PublicURL, "/")
+	}
+	for _, entry := range append(append([]string(nil), c.Server.TrustedProxies...), c.Server.TrustedProxyNetworks...) {
+		if _, _, err := net.ParseCIDR(entry); err != nil {
+			if net.ParseIP(entry) == nil {
+				return fmt.Errorf("invalid trusted proxy %q", entry)
+			}
+		}
 	}
 	if c.Defaults.SourceTimeout == 0 {
 		c.Defaults.SourceTimeout = Duration(3 * time.Second)

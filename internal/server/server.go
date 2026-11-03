@@ -25,7 +25,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"golang.org/x/crypto/bcrypt"
 	"net/http/pprof"
 )
 
@@ -38,6 +37,8 @@ type Server struct {
 	metrics   *Metrics
 	tls       *certificateProvider
 	startedAt time.Time
+	authMu    sync.Mutex
+	auth      *authLimiter
 
 	httpServer      *http.Server
 	httpsServer     *http.Server
@@ -74,7 +75,7 @@ func New(cfg *config.Config, configPath string, logger *slog.Logger) (*Server, e
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{log: logger, store: store, hub: hub, metrics: metrics, tls: tlsProvider, startedAt: time.Now()}
+	s := &Server{log: logger, store: store, hub: hub, metrics: metrics, tls: tlsProvider, startedAt: time.Now(), auth: newAuthLimiter()}
 	return s, nil
 }
 
@@ -339,7 +340,7 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listenerContext(r *http.Request) context.Context {
-	return stream.WithListenerClientInfo(r.Context(), requestClientIP(r), r.Header.Get("User-Agent"))
+	return stream.WithListenerClientInfo(r.Context(), s.requestClientIP(r), r.Header.Get("User-Agent"))
 }
 
 type closerFunc func() error
@@ -347,17 +348,23 @@ type closerFunc func() error
 func (f closerFunc) Close() error { return f() }
 
 func (s *Server) handleSource(w http.ResponseWriter, r *http.Request, m *stream.Mount) {
-	if !s.checkSourceAuth(r, m.Config().Source) {
+	ok, locked, retryAfter := s.authenticateSource(r, m.Config().Source)
+	if locked {
+		writeAuthLockout(w, retryAfter)
+		return
+	}
+	if !ok {
 		w.Header().Set("WWW-Authenticate", `Basic realm="kite"`)
 		http.Error(w, "source authentication failed", http.StatusUnauthorized)
 		return
 	}
 	if err := m.AcquireSource(); err != nil {
+		s.log.Warn("source connection rejected: mount busy", "mount", m.Config().Path, "remote_ip", s.requestClientIP(r), "method", r.Method)
 		http.Error(w, "source already connected", http.StatusForbidden)
 		return
 	}
 	defer m.ReleaseSource()
-	m.SetSourceStreamMetadata(parseSourceStreamMetadata(r))
+	m.SetSourceStreamMetadata(s.parseSourceStreamMetadata(r))
 	s.log.Info("source connected", "mount", m.Config().Path, "method", r.Method, "proto", r.Proto, "content_length", r.ContentLength, "transfer_encoding", r.TransferEncoding, "expect", r.Header.Get("Expect"))
 	if r.ProtoMajor == 1 && r.ContentLength == 0 && len(r.TransferEncoding) == 0 {
 		s.handleRawSource(w, r, m)
@@ -437,33 +444,67 @@ func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mou
 		return
 	}
 	writer.last = time.Time{}
+	inBurst := sub.HasBuffered()
 	sent := 0
+	var lastSentTitle string
+	var hasSentTitle bool
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
 	for {
-		select {
-		case <-r.Context().Done():
-			return
-		default:
-			chunk, err := sub.Next(r.Context())
-			if err != nil {
-				return
-			}
-			data := chunk.Data
-			for len(data) > 0 {
-				need := metaInt - sent
-				if len(data) < need {
-					n, err := writer.Write(data)
-					sub.RecordWrite(n)
-					if err != nil {
+		var (
+			chunk stream.Chunk
+			err   error
+		)
+		if !inBurst && !sub.HasBuffered() && writer.Buffered() > 0 {
+			rem := writer.RemainingInterval()
+			if rem <= 0 {
+				if err := writer.Flush(); err != nil {
+					if isDeadlineError(err) {
+						sub.Close("write_timeout")
+					}
+					return
+				}
+				chunk, err = sub.Next(r.Context())
+			} else {
+				if timer == nil {
+					timer = time.NewTimer(rem)
+				} else {
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(rem)
+				}
+				var timedOut bool
+				chunk, timedOut, err = sub.NextOrTimeout(r.Context(), timer.C)
+				if err == nil && timedOut {
+					if err := writer.Flush(); err != nil {
 						if isDeadlineError(err) {
 							sub.Close("write_timeout")
 						}
 						return
 					}
-					sent += len(data)
-					data = nil
-					continue
+					chunk, err = sub.Next(r.Context())
 				}
-				n, err := writer.Write(data[:need])
+			}
+		} else {
+			chunk, err = sub.Next(r.Context())
+		}
+		if err != nil {
+			return
+		}
+		data := chunk.Data
+		for len(data) > 0 {
+			need := metaInt - sent
+			if len(data) < need {
+				n, err := writer.Write(data)
 				sub.RecordWrite(n)
 				if err != nil {
 					if isDeadlineError(err) {
@@ -471,29 +512,43 @@ func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mou
 					}
 					return
 				}
-				data = data[need:]
-				sent = 0
-				block := stream.FormatICYMetadataBlock(m.Metadata().Title)
-				if _, err := writer.Write(block); err != nil {
-					if isDeadlineError(err) {
-						sub.Close("write_timeout")
-					}
-					return
-				}
-				if err := writer.Flush(); err != nil {
-					if isDeadlineError(err) {
-						sub.Close("write_timeout")
-					}
-					return
-				}
+				sent += len(data)
+				data = nil
+				continue
 			}
-			if !sub.HasBuffered() {
-				if err := writer.Flush(); err != nil {
-					if isDeadlineError(err) {
-						sub.Close("write_timeout")
-					}
-					return
+			n, err := writer.Write(data[:need])
+			sub.RecordWrite(n)
+			if err != nil {
+				if isDeadlineError(err) {
+					sub.Close("write_timeout")
 				}
+				return
+			}
+			data = data[need:]
+			sent = 0
+			curTitle := m.Metadata().StreamTitle()
+			var block []byte
+			if hasSentTitle && curTitle == lastSentTitle {
+				block = []byte{0}
+			} else {
+				block = stream.FormatICYMetadataBlock(curTitle)
+				lastSentTitle = curTitle
+				hasSentTitle = true
+			}
+			if _, err := writer.Write(block); err != nil {
+				if isDeadlineError(err) {
+					sub.Close("write_timeout")
+				}
+				return
+			}
+		}
+		if inBurst && !sub.HasBuffered() {
+			inBurst = false
+			if err := writer.Flush(); err != nil {
+				if isDeadlineError(err) {
+					sub.Close("write_timeout")
+				}
+				return
 			}
 		}
 	}
@@ -652,10 +707,7 @@ func (s *Server) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "audio/x-mpegurl")
-	base := "https://" + r.Host
-	if r.TLS == nil {
-		base = "http://" + r.Host
-	}
+	base := s.requestBaseURL(r)
 	fmt.Fprintf(w, "#EXTM3U\n#EXTINF:-1,Kite\n%s%s\n", base, mount)
 }
 func (s *Server) handleStatusPage(w http.ResponseWriter, r *http.Request) {
@@ -687,23 +739,37 @@ func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.checkSourceAuth(r, m.Config().Source) && !s.checkAdminBasicAuth(r, "") {
+	user, _, hasBasic := r.BasicAuth()
+	var authOK, locked bool
+	var retryAfter time.Duration
+	if hasBasic && user == s.icecastAdminUser() && user != m.Config().Source.Username && s.icecastAdminPassword() != "" {
+		authOK, locked, retryAfter = s.authenticateBasic(r, "icecast_admin", s.icecastAdminUser(), s.icecastAdminPassword())
+	} else {
+		authOK, locked, retryAfter = s.authenticateSource(r, m.Config().Source)
+	}
+	if locked {
+		writeAuthLockout(w, retryAfter)
+		return
+	}
+	if !authOK {
 		w.Header().Set("WWW-Authenticate", `Basic realm="kite"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	title := r.FormValue("song")
-	if title == "" {
-		artist := r.FormValue("artist")
-		track := r.FormValue("title")
-		if artist != "" && track != "" {
-			title = artist + " - " + track
-		} else {
-			title = track
-		}
+	urlVal := r.FormValue("url")
+	if song := r.FormValue("song"); song != "" {
+		m.SetMetadata(stream.Metadata{Title: song, URL: urlVal})
+	} else {
+		m.SetMetadata(stream.Metadata{
+			Artist: r.FormValue("artist"),
+			Song:   r.FormValue("title"),
+			URL:    urlVal,
+		})
 	}
-	m.SetMetadata(stream.Metadata{Title: title, URL: r.FormValue("url")})
-	writeJSON(w, 200, map[string]any{"ok": true, "metadata": m.Metadata()})
+	writeXML(w, http.StatusOK, xmlIceResponse{
+		Message: "Metadata update successful",
+		Return:  1,
+	})
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -821,6 +887,12 @@ func validateFallbackFiles(cfg *config.Config) error {
 
 func (s *Server) restoreRedactedSecrets(next *config.Config) {
 	current := s.Config()
+	if next.Admin.IcecastAdminPassword == "<redacted>" {
+		next.Admin.IcecastAdminPassword = current.Admin.IcecastAdminPassword
+	}
+	if next.Server.IcecastAdminPassword == "<redacted>" {
+		next.Server.IcecastAdminPassword = current.Server.IcecastAdminPassword
+	}
 	for i := range next.Mounts {
 		if next.Mounts[i].Source.PasswordBcrypt == "<redacted>" {
 			if old, ok := current.Mount(next.Mounts[i].Path); ok {
@@ -837,6 +909,12 @@ func (s *Server) restoreRedactedSecrets(next *config.Config) {
 
 func redactedConfig(current *config.Config) *config.Config {
 	copyConfig := *current
+	if copyConfig.Admin.IcecastAdminPassword != "" {
+		copyConfig.Admin.IcecastAdminPassword = "<redacted>"
+	}
+	if copyConfig.Server.IcecastAdminPassword != "" {
+		copyConfig.Server.IcecastAdminPassword = "<redacted>"
+	}
 	copyConfig.Mounts = append([]config.Mount(nil), current.Mounts...)
 	for i := range copyConfig.Mounts {
 		if copyConfig.Mounts[i].Source.PasswordBcrypt != "" {
@@ -873,11 +951,21 @@ func (s *Server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "admin token is not configured", http.StatusServiceUnavailable)
 			return
 		}
+		ip := s.requestClientIP(r)
+		limiter := s.getAuthLimiter()
+		if isLocked, wait, failures := limiter.checkLocked(ip); isLocked {
+			s.log.Warn("authentication rejected: IP locked out", "scope", "admin_api", "ip", ip, "token", "[REDACTED]", "failures", failures, "retry_after", wait.Round(time.Millisecond))
+			writeAuthLockout(w, wait)
+			return
+		}
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			failures, lockDelay := limiter.recordFailure(ip)
+			s.log.Warn("authentication failed", "scope", "admin_api", "ip", ip, "token", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond))
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		limiter.recordSuccess(ip)
 		next(w, r)
 	}
 }
@@ -892,36 +980,28 @@ func (s *Server) adminToken() string {
 	}
 	return ""
 }
-func (s *Server) checkSourceAuth(r *http.Request, cred config.SourceCredential) bool {
-	user, pass, ok := r.BasicAuth()
-	if !ok {
-		return false
-	}
-	if user != cred.Username {
-		return false
-	}
+func (s *Server) authenticateSource(r *http.Request, cred config.SourceCredential) (ok bool, locked bool, retryAfter time.Duration) {
 	expected := cred.PasswordBcrypt
 	if cred.PasswordEnv != "" {
-		b, err := config.ResolveSecret(cred.PasswordEnv, "")
-		if err != nil {
-			return false
+		if b, err := config.ResolveSecret(cred.PasswordEnv, ""); err == nil {
+			expected = string(b)
+		} else {
+			expected = ""
 		}
-		expected = string(b)
 	}
 	if cred.PasswordFile != "" {
-		b, err := config.ResolveSecret("", cred.PasswordFile)
-		if err != nil {
-			return false
+		if b, err := config.ResolveSecret("", cred.PasswordFile); err == nil {
+			expected = string(b)
+		} else {
+			expected = ""
 		}
-		expected = string(b)
 	}
-	if expected == "" {
-		return false
-	}
-	if strings.HasPrefix(expected, "$2") {
-		return bcrypt.CompareHashAndPassword([]byte(expected), []byte(pass)) == nil
-	}
-	return subtle.ConstantTimeCompare([]byte(expected), []byte(pass)) == 1
+	return s.authenticateBasic(r, "source", cred.Username, expected)
+}
+
+func (s *Server) checkSourceAuth(r *http.Request, cred config.SourceCredential) bool {
+	ok, _, _ := s.authenticateSource(r, cred)
+	return ok
 }
 
 func setCORS(w http.ResponseWriter, origins []string, origin string) {
@@ -1013,6 +1093,8 @@ func isDeadlineError(err error) bool {
 	return stream.IsTimeoutError(err)
 }
 
+const intervalWriteBatchSize = 4096
+
 type intervalWriter struct {
 	writer   io.Writer
 	flusher  http.Flusher
@@ -1020,6 +1102,7 @@ type intervalWriter struct {
 	interval time.Duration
 	timeout  time.Duration
 	last     time.Time
+	buf      []byte
 	err      error
 }
 
@@ -1034,7 +1117,22 @@ func newIntervalWriter(w http.ResponseWriter, interval, timeout time.Duration) *
 		rc:       http.NewResponseController(w),
 		interval: interval,
 		timeout:  timeout,
+		buf:      make([]byte, 0, intervalWriteBatchSize*2),
 	}
+}
+func (w *intervalWriter) Buffered() int { return len(w.buf) }
+func (w *intervalWriter) RemainingInterval() time.Duration {
+	if w.interval <= 0 || len(w.buf) == 0 {
+		return 0
+	}
+	if w.last.IsZero() {
+		return w.interval
+	}
+	rem := w.interval - time.Since(w.last)
+	if rem < 0 {
+		return 0
+	}
+	return rem
 }
 func (w *intervalWriter) setWriteDeadline() time.Time {
 	if w.rc != nil && w.timeout > 0 {
@@ -1059,27 +1157,50 @@ func (w *intervalWriter) Write(p []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
 	}
-	deadline := w.setWriteDeadline()
-	n, err := w.writer.Write(p)
-	if err != nil {
-		err = normalizeWriteErr(err, deadline)
-		w.err = err
-		return n, err
+	if len(p) == 0 {
+		return 0, nil
 	}
-	if w.flusher != nil && (w.interval <= 0 || time.Since(w.last) >= w.interval) {
+	if w.interval <= 0 {
+		deadline := w.setWriteDeadline()
+		n, err := w.writer.Write(p)
+		if err != nil {
+			err = normalizeWriteErr(err, deadline)
+			w.err = err
+			return n, err
+		}
 		if err := w.Flush(); err != nil {
 			return n, err
 		}
 		return n, nil
 	}
-	w.clearWriteDeadline()
-	return n, nil
+	if len(w.buf) == 0 && w.last.IsZero() {
+		w.last = time.Now()
+	}
+	w.buf = append(w.buf, p...)
+	if len(w.buf) >= intervalWriteBatchSize || (!w.last.IsZero() && time.Since(w.last) >= w.interval) {
+		if err := w.Flush(); err != nil {
+			return len(p), err
+		}
+	}
+	return len(p), nil
 }
 func (w *intervalWriter) Flush() error {
 	if w.err != nil {
 		return w.err
 	}
+	if len(w.buf) > 0 {
+		deadline := w.setWriteDeadline()
+		_, err := w.writer.Write(w.buf)
+		w.buf = w.buf[:0]
+		if err != nil {
+			err = normalizeWriteErr(err, deadline)
+			w.err = err
+			return err
+		}
+	}
 	if w.flusher == nil {
+		w.clearWriteDeadline()
+		w.last = time.Now()
 		return nil
 	}
 	deadline := w.setWriteDeadline()

@@ -10,6 +10,10 @@ Kite uses strict, versioned YAML. Unknown fields and invalid fallback graphs pre
 
 `server.status_page_enabled` controls the built-in HTML status and player page served at `/`, `/index.html`, and `/status.xsl`. It is enabled by default and can be toggled live.
 
+`server.public_url` (e.g. `https://stream.example.com`) or `server.hostname` (e.g. `stream.example.com:8000`) overrides the client `Host` header when building listen URLs in playlists and status responses. When a request arrives from an IP/CIDR listed in `server.trusted_proxies` (or `server.trusted_proxy_networks`), Kite honors `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-For`.
+
+`admin.icecast_admin_user` (default `admin`) and `admin.icecast_admin_password` (or `icecast_admin_password_env` / `icecast_admin_password_file` / `KITE_ICECAST_ADMIN_PASSWORD`) configure the separate Basic Auth credentials for Icecast-compatible `/admin/*` XML endpoints.
+
 Changing any listener address at runtime requires a restart.
 
 ## TLS
@@ -90,7 +94,7 @@ Kite switches after `source_timeout` without valid input. It returns to a stable
 
 Kite validates every configured fallback file, folder, and playlist during startup and before a dynamic configuration commit. A missing file or invalid directory rejects the configuration without changing runtime state.
 
-Fallback audio is looped and paced using `metadata.bitrate`, or 128 kbit/s if omitted.
+Fallback audio is looped and paced using `metadata.bitrate`, or 128 kbit/s if omitted. `metadata.bitrate` may be specified in bps (e.g. `128000`) or kbps (e.g. `128`); values `>= 1000` are treated as bps and divided by 1000 so all Icecast outputs (`icy-br`, `/status-json.xsl`, `audio_info`, and `/admin/*` XML) consistently report kbps.
 
 ## Buffering
 
