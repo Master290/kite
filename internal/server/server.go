@@ -315,7 +315,7 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 		s.streamICY(w, r, m)
 		return
 	}
-	sub := m.Subscribe(listenerTransport(r))
+	sub := m.SubscribeContext(r.Context(), listenerTransport(r))
 	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration(), s.listenerWriteTimeout(m))
 	defer writer.Flush()
 	if err := writer.Flush(); err != nil {
@@ -401,11 +401,7 @@ func (s *Server) handleRawSource(w http.ResponseWriter, r *http.Request, m *stre
 func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mount) {
 	metaInt := m.Config().ICYMetaInterval
 	w.Header().Set("icy-metaint", strconv.Itoa(metaInt))
-	transport := "http-icy"
-	if isRelaySubscriber(r) {
-		transport = "relay"
-	}
-	sub := m.Subscribe(transport)
+	sub := m.SubscribeContext(r.Context(), "http-icy")
 	defer sub.Close("client_closed")
 	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration(), s.listenerWriteTimeout(m))
 	defer writer.Flush()
@@ -416,7 +412,6 @@ func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mou
 		return
 	}
 	writer.last = time.Time{}
-	meta := ""
 	sent := 0
 	for {
 		select {
@@ -453,13 +448,7 @@ func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mou
 				}
 				data = data[need:]
 				sent = 0
-				meta = "StreamTitle='" + strings.ReplaceAll(m.Metadata().Title, "'", "\\'") + "';"
-				if len(meta) > 4080 {
-					meta = meta[:4080]
-				}
-				block := []byte{byte((len(meta) + 16 - 1) / 16)}
-				padded := append([]byte(meta), make([]byte, int(block[0])*16-len(meta))...)
-				block = append(block, padded...)
+				block := stream.FormatICYMetadataBlock(m.Metadata().Title)
 				if _, err := writer.Write(block); err != nil {
 					if isDeadlineError(err) {
 						sub.Close("write_timeout")
@@ -948,14 +937,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func isRelaySubscriber(r *http.Request) bool {
-	return strings.HasPrefix(r.Header.Get("User-Agent"), "Kite/1.0 (Relay)")
-}
-
 func listenerTransport(r *http.Request) string {
-	if isRelaySubscriber(r) {
-		return "relay"
-	}
 	switch r.ProtoMajor {
 	case 2:
 		return "http2"

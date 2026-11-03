@@ -41,6 +41,9 @@ type Chunk struct {
 type Observer interface {
 	SourceConnected(mount string)
 	SourceDisconnected(mount string)
+	RelayConnected(mount string)
+	RelayDisconnected(mount, reason string)
+	RelayReconnect(mount, reason string)
 	BytesIn(mount string, n int)
 	BytesOut(mount, transport string, n int)
 	ListenerOpened(mount, transport string)
@@ -52,6 +55,9 @@ type nopObserver struct{}
 
 func (nopObserver) SourceConnected(string)                {}
 func (nopObserver) SourceDisconnected(string)             {}
+func (nopObserver) RelayConnected(string)                 {}
+func (nopObserver) RelayDisconnected(string, string)      {}
+func (nopObserver) RelayReconnect(string, string)         {}
 func (nopObserver) BytesIn(string, int)                   {}
 func (nopObserver) BytesOut(string, string, int)          {}
 func (nopObserver) ListenerOpened(string, string)         {}
@@ -120,17 +126,28 @@ func (h *Hub) Status() []Status {
 	return items
 }
 
+type internalSubscriberKey struct{}
+
+// WithInternalSubscriber marks a context as originating from an internal
+// relay or fallback subscriber so it is excluded from public listener counts.
+func WithInternalSubscriber(ctx context.Context) context.Context {
+	return context.WithValue(ctx, internalSubscriberKey{}, true)
+}
+
+// IsInternalSubscriber reports whether ctx was marked with WithInternalSubscriber.
+func IsInternalSubscriber(ctx context.Context) bool {
+	v, _ := ctx.Value(internalSubscriberKey{}).(bool)
+	return v
+}
+
 type subscription struct {
 	mount     *Mount
 	id        uint64
 	transport string
+	internal  bool
 }
 
 func (s subscription) Close(reason string) { s.mount.removeListener(s.id, reason) }
-
-func isInternalTransport(transport string) bool {
-	return transport == "fallback" || transport == "relay"
-}
 
 func (s subscription) Next(ctx context.Context) (Chunk, error) {
 	path := s.mount.Config().Path
@@ -150,7 +167,7 @@ func (s subscription) Next(ctx context.Context) (Chunk, error) {
 		if len(s.mount.ring) > 0 && listener.cursor < s.mount.ringFirst {
 			delete(s.mount.listeners, s.id)
 			s.mount.mu.Unlock()
-			if !isInternalTransport(listener.transport) {
+			if !listener.internal {
 				s.mount.observer.ListenerClosed(path, listener.transport, "slow")
 			}
 			return Chunk{}, ErrSlowListener
@@ -175,7 +192,7 @@ func (s subscription) Next(ctx context.Context) (Chunk, error) {
 }
 
 func (s subscription) RecordWrite(n int) {
-	if n <= 0 || isInternalTransport(s.transport) {
+	if n <= 0 || s.internal {
 		return
 	}
 	s.mount.mu.Lock()
@@ -187,6 +204,7 @@ func (s subscription) RecordWrite(n int) {
 type listener struct {
 	cursor       uint64
 	transport    string
+	internal     bool
 	prelude      [][]byte
 	preludeIndex int
 }
@@ -208,26 +226,28 @@ type Mount struct {
 
 	primary chan ingest
 
-	mu           sync.RWMutex
-	listeners    map[uint64]*listener
-	eventSubs    map[uint64]chan Event
-	eventHistory []Event
-	nextID       uint64
-	sequence     uint64
-	ring         []Chunk
-	ringFirst    uint64
-	ringBytes    int
-	notify       chan struct{}
-	eventID      uint64
-	source       bool
-	isRelay      bool
-	sourceSince  time.Time
-	lastSource   time.Time
-	active       string
-	metadata     Metadata
-	bytesIn      uint64
-	bytesOut     uint64
-	initChunks   [][]byte
+	mu             sync.RWMutex
+	listeners      map[uint64]*listener
+	eventSubs      map[uint64]chan Event
+	eventHistory   []Event
+	nextID         uint64
+	sequence       uint64
+	ring           []Chunk
+	ringFirst      uint64
+	ringBytes      int
+	notify         chan struct{}
+	eventID        uint64
+	source         bool
+	isRelay        bool
+	sourceSince    time.Time
+	lastSource     time.Time
+	active         string
+	metadata       Metadata
+	primaryMeta    Metadata
+	fallbackTitled bool
+	bytesIn        uint64
+	bytesOut       uint64
+	initChunks     [][]byte
 
 	sourceGuard  chan struct{}
 	sourceCloser io.Closer
@@ -352,6 +372,7 @@ func (m *Mount) AcquireSource() error {
 	m.isRelay = false
 	m.sourceSince = time.Now()
 	m.lastSource = m.sourceSince
+	m.primaryMeta = Metadata{}
 	m.initChunks = nil
 	m.mu.Unlock()
 	m.observer.SourceConnected(m.Config().Path)
@@ -367,6 +388,7 @@ func (m *Mount) AcquireRelaySource() error {
 		m.isRelay = true
 		m.sourceSince = time.Now()
 		m.lastSource = m.sourceSince
+		m.primaryMeta = Metadata{}
 		m.initChunks = nil
 		m.mu.Unlock()
 		m.observer.SourceConnected(m.Config().Path)
@@ -440,7 +462,52 @@ func (m *Mount) Write(p []byte) error {
 
 func (m *Mount) SetMetadata(md Metadata) {
 	m.mu.Lock()
+	m.primaryMeta = md
 	m.metadata = md
+	m.fallbackTitled = false
+	m.mu.Unlock()
+	m.publish("metadata", map[string]any{"title": md.Title, "url": md.URL})
+}
+
+func (m *Mount) setFallbackMetadata(md Metadata) {
+	m.mu.Lock()
+	m.metadata = md
+	m.fallbackTitled = true
+	m.mu.Unlock()
+	m.publish("metadata", map[string]any{"title": md.Title, "url": md.URL})
+}
+
+func (m *Mount) setDefaultPrimaryTitle(title string) {
+	if title == "" {
+		return
+	}
+	m.mu.Lock()
+	if m.primaryMeta.Title != "" {
+		m.mu.Unlock()
+		return
+	}
+	m.primaryMeta = Metadata{Title: title}
+	if !m.fallbackTitled && m.metadata.Title == "" {
+		m.metadata = m.primaryMeta
+		m.mu.Unlock()
+		m.publish("metadata", map[string]any{"title": title, "url": ""})
+		return
+	}
+	m.mu.Unlock()
+}
+
+func (m *Mount) restorePrimaryMetadata(cfg config.Mount) {
+	m.mu.Lock()
+	if !m.fallbackTitled {
+		m.mu.Unlock()
+		return
+	}
+	md := m.primaryMeta
+	if md.Title == "" {
+		md.Title = cfg.Metadata.Name
+	}
+	m.metadata = md
+	m.fallbackTitled = false
 	m.mu.Unlock()
 	m.publish("metadata", map[string]any{"title": md.Title, "url": md.URL})
 }
@@ -448,6 +515,18 @@ func (m *Mount) SetMetadata(md Metadata) {
 func (m *Mount) Metadata() Metadata { m.mu.RLock(); defer m.mu.RUnlock(); return m.metadata }
 
 func (m *Mount) Subscribe(transport string) subscription {
+	return m.subscribe(transport, false)
+}
+
+func (m *Mount) SubscribeInternal(transport string) subscription {
+	return m.subscribe(transport, true)
+}
+
+func (m *Mount) SubscribeContext(ctx context.Context, transport string) subscription {
+	return m.subscribe(transport, IsInternalSubscriber(ctx))
+}
+
+func (m *Mount) subscribe(transport string, internal bool) subscription {
 	m.mu.Lock()
 	m.nextID++
 	id := m.nextID
@@ -455,13 +534,13 @@ func (m *Mount) Subscribe(transport string) subscription {
 	for i := range m.initChunks {
 		prelude[i] = append([]byte(nil), m.initChunks[i]...)
 	}
-	l := &listener{cursor: m.sequence + 1, transport: transport, prelude: prelude}
+	l := &listener{cursor: m.sequence + 1, transport: transport, internal: internal, prelude: prelude}
 	m.listeners[id] = l
 	m.mu.Unlock()
-	if !isInternalTransport(transport) {
+	if !internal {
 		m.observer.ListenerOpened(m.Config().Path, transport)
 	}
-	return subscription{mount: m, id: id, transport: transport}
+	return subscription{mount: m, id: id, transport: transport, internal: internal}
 }
 
 func bufferBytes(cfg config.Mount, defaults config.Defaults) int {
@@ -490,7 +569,7 @@ func (m *Mount) removeListener(id uint64, reason string) {
 		delete(m.listeners, id)
 	}
 	m.mu.Unlock()
-	if ok && !isInternalTransport(listener.transport) {
+	if ok && !listener.internal {
 		m.observer.ListenerClosed(m.Config().Path, listener.transport, reason)
 	}
 }
@@ -567,6 +646,7 @@ func (m *Mount) run() {
 					}
 					previous := active
 					m.setActive("primary")
+					m.restorePrimaryMetadata(cfg)
 					if previous != "silence" && cfg.Profile == "ogg-opus" {
 						for _, init := range m.InitialChunks() {
 							m.broadcast(init, time.Now())
@@ -656,7 +736,7 @@ func (m *Mount) startFallback(ctx context.Context, cfg config.Mount, desired str
 				continue
 			}
 			m.setActive(fb.Mount)
-			sub := target.Subscribe("fallback")
+			sub := target.SubscribeInternal("fallback")
 			go func() {
 				defer close(out)
 				defer sub.Close("fallback_end")
@@ -678,7 +758,7 @@ func (m *Mount) startFallback(ctx context.Context, cfg config.Mount, desired str
 			m.setActive("file:" + fb.File)
 			title := FormatTrackTitle(fb.File, fb.Title)
 			if title != "" {
-				m.SetMetadata(Metadata{Title: title})
+				m.setFallbackMetadata(Metadata{Title: title})
 			}
 			go pumpFile(ctx, fb.File, cfg.Profile, cfg.Metadata.Bitrate, out)
 			return out
@@ -689,7 +769,7 @@ func (m *Mount) startFallback(ctx context.Context, cfg config.Mount, desired str
 			if err != nil || len(files) == 0 {
 				continue
 			}
-			go pumpPlaylist(ctx, files, fb.Shuffle, cfg.Profile, cfg.Metadata.Bitrate, fb.Title, m.SetMetadata, out)
+			go pumpPlaylist(ctx, files, fb.Shuffle, cfg.Profile, cfg.Metadata.Bitrate, fb.Title, m.setFallbackMetadata, out)
 			return out
 		}
 		if fb.Playlist != "" && "playlist:"+fb.Playlist == desired {
@@ -698,7 +778,7 @@ func (m *Mount) startFallback(ctx context.Context, cfg config.Mount, desired str
 			if err != nil || len(files) == 0 {
 				continue
 			}
-			go pumpPlaylist(ctx, files, fb.Shuffle, cfg.Profile, cfg.Metadata.Bitrate, fb.Title, m.SetMetadata, out)
+			go pumpPlaylist(ctx, files, fb.Shuffle, cfg.Profile, cfg.Metadata.Bitrate, fb.Title, m.setFallbackMetadata, out)
 			return out
 		}
 	}
@@ -794,7 +874,9 @@ func (m *Mount) closeListeners(reason string) {
 	transports := make([]string, 0, len(m.listeners))
 	for id, l := range m.listeners {
 		delete(m.listeners, id)
-		transports = append(transports, l.transport)
+		if !l.internal {
+			transports = append(transports, l.transport)
+		}
 	}
 	for id, ch := range m.eventSubs {
 		delete(m.eventSubs, id)
@@ -805,9 +887,7 @@ func (m *Mount) closeListeners(reason string) {
 	close(oldNotify)
 	m.mu.Unlock()
 	for _, transport := range transports {
-		if !isInternalTransport(transport) {
-			m.observer.ListenerClosed(path, transport, reason)
-		}
+		m.observer.ListenerClosed(path, transport, reason)
 	}
 }
 
@@ -817,7 +897,7 @@ func (m *Mount) Status() Status {
 	defer m.mu.RUnlock()
 	listeners := 0
 	for _, l := range m.listeners {
-		if !isInternalTransport(l.transport) {
+		if !l.internal {
 			listeners++
 		}
 	}

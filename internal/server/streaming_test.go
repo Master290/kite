@@ -307,7 +307,7 @@ func TestStreamICYEmitsMetadataBlocks(t *testing.T) {
 		t.Fatal("empty metadata block")
 	}
 	meta := buf[len(payload)+1 : len(payload)+1+blockLen*16]
-	want := "StreamTitle='It\\'s a Test';"
+	want := "StreamTitle='It's a Test';"
 	if !bytes.Contains(meta, []byte(want)) {
 		t.Fatalf("metadata block %q missing %q", meta, want)
 	}
@@ -350,6 +350,9 @@ func TestStreamICYTruncatesHugeTitles(t *testing.T) {
 	}
 	if !bytes.HasPrefix(meta, []byte("StreamTitle='")) {
 		t.Fatalf("meta prefix=%q", meta[:20])
+	}
+	if !bytes.HasSuffix(meta, []byte("';")) {
+		t.Fatalf("meta suffix=%q, want \"';\"", meta[len(meta)-10:])
 	}
 }
 
@@ -941,5 +944,30 @@ func TestListenerTransportLabelsByProtocolMajor(t *testing.T) {
 	}
 	if got := listenerTransport(&http.Request{ProtoMajor: 3}); got != "http3" {
 		t.Fatalf("ProtoMajor=3 transport=%q, want http3", got)
+	}
+}
+
+func TestSpoofedRelayUserAgentCountedNormally(t *testing.T) {
+	s, ts := publicServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/radio", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("User-Agent", "Kite/1.0 (Relay)")
+	req.Header.Set("Icy-MetaData", "1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	waitForListeners(t, s, "/radio", 1)
+	metrics := metricsOutput(t, s)
+	if !strings.Contains(metrics, `kite_listeners{mount="/radio",transport="http-icy"} 1`) {
+		t.Fatalf("expected spoofed UA client to be counted as http-icy listener, got:\n%s", metrics)
 	}
 }

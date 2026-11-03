@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"strings"
+	"unicode/utf8"
 )
 
 // icyReader wraps an audio stream that contains interleaved ICY metadata blocks.
@@ -73,6 +74,53 @@ func (ir *icyReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+const maxICYMetadataBytes = 4080
+
+// FormatICYMetadata formats a StreamTitle metadata string in Icecast style
+// without escaping single quotes, stripping/replacing only framing-breaking
+// characters, truncating on a UTF-8 rune boundary, and always ending with "';".
+func FormatICYMetadata(title string) string {
+	const (
+		prefix        = "StreamTitle='"
+		suffix        = "';"
+		maxTitleBytes = maxICYMetadataBytes - len(prefix) - len(suffix)
+	)
+	clean := strings.Map(func(r rune) rune {
+		switch r {
+		case 0:
+			return -1
+		case '\r', '\n':
+			return ' '
+		default:
+			return r
+		}
+	}, title)
+	for strings.Contains(clean, suffix) {
+		clean = strings.ReplaceAll(clean, suffix, "' ")
+	}
+	if len(clean) > maxTitleBytes {
+		cut := maxTitleBytes
+		for cut > 0 && !utf8.RuneStart(clean[cut]) {
+			cut--
+		}
+		clean = clean[:cut]
+		for len(clean) > 0 && !utf8.ValidString(clean) {
+			clean = clean[:len(clean)-1]
+		}
+	}
+	return prefix + clean + suffix
+}
+
+// FormatICYMetadataBlock encodes a length-prefixed, 16-byte zero-padded ICY metadata block.
+func FormatICYMetadataBlock(title string) []byte {
+	meta := FormatICYMetadata(title)
+	blocks := (len(meta) + 15) / 16
+	out := make([]byte, 1+blocks*16)
+	out[0] = byte(blocks)
+	copy(out[1:], meta)
+	return out
+}
+
 // ParseICYMetadata parses raw ICY metadata block into title and url.
 // Format: StreamTitle='...';StreamUrl='...';
 func ParseICYMetadata(raw []byte) (title string, url string) {
@@ -88,8 +136,12 @@ func ParseICYMetadata(raw []byte) (title string, url string) {
 			break
 		}
 		eq := strings.IndexByte(s, '=')
-		if eq <= 0 {
+		if eq < 0 {
 			break
+		}
+		if semi := strings.IndexByte(s[:eq], ';'); semi >= 0 {
+			s = s[semi+1:]
+			continue
 		}
 		key := strings.TrimSpace(s[:eq])
 		rest := strings.TrimLeft(s[eq+1:], " \t")
@@ -98,12 +150,11 @@ func ParseICYMetadata(raw []byte) (title string, url string) {
 			quote := rest[0]
 			closing := string([]byte{quote, ';'})
 			content := rest[1:]
-			end := findICYClosing(content, closing)
-			if end >= 0 {
-				val = strings.ReplaceAll(content[:end], `\`+string(quote), string(quote))
+			if end := strings.Index(content, closing); end >= 0 {
+				val = content[:end]
 				s = content[end+len(closing):]
 			} else if len(content) > 0 && content[len(content)-1] == quote {
-				val = strings.ReplaceAll(content[:len(content)-1], `\`+string(quote), string(quote))
+				val = content[:len(content)-1]
 				s = ""
 			} else {
 				val = content
@@ -118,6 +169,9 @@ func ParseICYMetadata(raw []byte) (title string, url string) {
 				s = ""
 			}
 		}
+		if key == "" {
+			continue
+		}
 		switch strings.ToLower(key) {
 		case "streamtitle":
 			title = val
@@ -126,23 +180,4 @@ func ParseICYMetadata(raw []byte) (title string, url string) {
 		}
 	}
 	return title, url
-}
-
-func findICYClosing(s, closing string) int {
-	offset := 0
-	for {
-		idx := strings.Index(s[offset:], closing)
-		if idx < 0 {
-			return -1
-		}
-		pos := offset + idx
-		backslashes := 0
-		for i := pos - 1; i >= 0 && s[i] == '\\'; i-- {
-			backslashes++
-		}
-		if backslashes%2 == 0 {
-			return pos
-		}
-		offset = pos + len(closing)
-	}
 }

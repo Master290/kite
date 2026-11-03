@@ -3,7 +3,9 @@ package stream
 import (
 	"bytes"
 	"io"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestParseICYMetadata(t *testing.T) {
@@ -23,6 +25,52 @@ func TestParseICYMetadata(t *testing.T) {
 	}
 	if url != "https://radio.example/track;1" {
 		t.Fatalf("expected url with semicolon, got %q", url)
+	}
+
+	malformedAndSpaced := []byte("=x; garbage;  StreamTitle = 'It's Live';  StreamUrl = 'https://radio.example';")
+	title, url = ParseICYMetadata(malformedAndSpaced)
+	if title != "It's Live" {
+		t.Fatalf("expected title after malformed pairs, got %q", title)
+	}
+	if url != "https://radio.example" {
+		t.Fatalf("expected url after malformed pairs, got %q", url)
+	}
+}
+
+func TestICYMetadataRoundTrip(t *testing.T) {
+	cases := []string{
+		`Dir C:\`,
+		`It's`,
+		`Artist; feat. B`,
+		`Artist; feat. B - It's a Song (Dir C:\)`,
+		`Привет — мир; тест '123'`,
+	}
+	for _, want := range cases {
+		block := FormatICYMetadataBlock(want)
+		if len(block) < 17 || int(block[0])*16 != len(block)-1 {
+			t.Fatalf("invalid block framing for %q: len=%d header=%d", want, len(block), block[0])
+		}
+		got, _ := ParseICYMetadata(block[1:])
+		if got != want {
+			t.Fatalf("round-trip mismatch for %q: got %q (raw=%q)", want, got, block[1:])
+		}
+	}
+
+	// Verify UTF-8 rune-boundary truncation and trailing "';"
+	longUTF8 := strings.Repeat("Я", 2500) // 5000 bytes of 2-byte UTF-8 runes
+	formatted := FormatICYMetadata(longUTF8)
+	if len(formatted) > maxICYMetadataBytes {
+		t.Fatalf("formatted length %d exceeds %d", len(formatted), maxICYMetadataBytes)
+	}
+	if !strings.HasSuffix(formatted, "';") {
+		t.Fatalf("formatted metadata must end with \"';\", got suffix %q", formatted[len(formatted)-10:])
+	}
+	if !utf8.ValidString(formatted) {
+		t.Fatal("truncated metadata is not valid UTF-8")
+	}
+	got, _ := ParseICYMetadata([]byte(formatted))
+	if !utf8.ValidString(got) || len(got) == 0 || !strings.HasPrefix(longUTF8, got) {
+		t.Fatalf("unexpected truncated round-trip title len=%d valid=%v", len(got), utf8.ValidString(got))
 	}
 }
 
