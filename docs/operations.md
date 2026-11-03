@@ -17,6 +17,8 @@ Use the alert rules in the repository at [`deploy/prometheus/kite-alerts.yml`](h
 | Metric | Meaning |
 | --- | --- |
 | `kite_source_connected` | Primary source state by mount |
+| `kite_relay_connected` | Whether a relay upstream is currently connected by mount |
+| `kite_relay_reconnects_total` | Relay reconnect cycles by mount and reason (including failed connection attempts such as `connect_error`, `connect_timeout`, `bad_status`, `source_busy` and stream disconnects such as `eof`, `idle_timeout`, `read_timeout`, `preempted`, `stream_error`) |
 | `kite_listeners` | Current listeners by mount and transport |
 | `kite_source_bytes_total` | Bytes received from sources |
 | `kite_listener_bytes_total` | Bytes written to listeners |

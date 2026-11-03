@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -18,17 +18,18 @@ import (
 )
 
 const (
-	maxRelayBackoff         = 30 * time.Second
-	maxRelayBackoffAttempts = 5
+	maxRelayBackoff       = 30 * time.Second
+	minRelayProbeInterval = 5 * time.Second
 )
 
 type relayWorker struct {
-	mount      *Mount
-	cfg        config.RelayConfig
-	ctx        context.Context
-	cancel     context.CancelFunc
-	client     *http.Client
-	retryDelay time.Duration
+	mount           *Mount
+	cfg             config.RelayConfig
+	ctx             context.Context
+	cancel          context.CancelFunc
+	client          *http.Client
+	retryDelay      time.Duration
+	headUnsupported atomic.Bool
 }
 
 func (m *Mount) startRelay(cfg config.RelayConfig) {
@@ -106,13 +107,21 @@ func jitterRelayDelay(d time.Duration) time.Duration {
 	return jittered
 }
 
+func redactRelayURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "<invalid-url>"
+	}
+	return u.Redacted()
+}
+
 func (rw *relayWorker) run() {
 	baseDelay := rw.retryDelay
 	if baseDelay > maxRelayBackoff {
 		baseDelay = maxRelayBackoff
 	}
 	delay := baseDelay
-	failures := 0
+	probeSuppressed := false
 	for {
 		select {
 		case <-rw.ctx.Done():
@@ -126,41 +135,37 @@ func (rw *relayWorker) run() {
 		}
 		rw.mount.observer.RelayReconnect(rw.mount.Config().Path, reason)
 
-		if streamed {
+		if streamed && reason != "idle_timeout" {
 			delay = baseDelay
-			failures = 0
-		} else {
-			failures++
-			if failures >= maxRelayBackoffAttempts {
-				delay = baseDelay
-				failures = 0
-			}
+			probeSuppressed = false
 		}
 
 		wait := jitterRelayDelay(delay)
-		if rw.waitOrProbe(wait, baseDelay) {
-			delay = baseDelay
-			failures = 0
-			continue
-		}
-		if rw.ctx.Err() != nil {
-			return
-		}
-
 		if delay < maxRelayBackoff {
 			delay *= 2
 			if delay > maxRelayBackoff {
 				delay = maxRelayBackoff
 			}
 		}
+
+		if rw.waitOrProbe(wait, baseDelay, probeSuppressed) {
+			probeSuppressed = true
+		}
+		if rw.ctx.Err() != nil {
+			return
+		}
 	}
 }
 
-// waitOrProbe waits for wait duration, periodically probing the upstream when
-// backoff is elevated so recovery is fast once the upstream returns. Returns
-// true if a probe succeeded early.
-func (rw *relayWorker) waitOrProbe(wait, baseDelay time.Duration) bool {
-	if wait <= baseDelay*3/2 {
+// waitOrProbe waits for wait duration, periodically probing the upstream with
+// HEAD (no more often than every 5s, with ±20% jitter) when backoff is elevated.
+// Returns true if a 2xx HEAD probe succeeded early.
+func (rw *relayWorker) waitOrProbe(wait, baseDelay time.Duration, probeSuppressed bool) bool {
+	probeBase := baseDelay
+	if probeBase < minRelayProbeInterval {
+		probeBase = minRelayProbeInterval
+	}
+	if probeSuppressed || rw.headUnsupported.Load() || wait <= probeBase {
 		select {
 		case <-rw.ctx.Done():
 		case <-time.After(wait):
@@ -168,34 +173,37 @@ func (rw *relayWorker) waitOrProbe(wait, baseDelay time.Duration) bool {
 		return false
 	}
 
-	probeInterval := baseDelay
-	if probeInterval > 2*time.Second {
-		probeInterval = 2 * time.Second
-	}
-	if probeInterval < 20*time.Millisecond {
-		probeInterval = 20 * time.Millisecond
-	}
-
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	ticker := time.NewTicker(probeInterval)
-	defer ticker.Stop()
+	waitTimer := time.NewTimer(wait)
+	defer waitTimer.Stop()
+	probeTimer := time.NewTimer(jitterRelayDelay(probeBase))
+	defer probeTimer.Stop()
 
 	for {
 		select {
 		case <-rw.ctx.Done():
 			return false
-		case <-timer.C:
+		case <-waitTimer.C:
 			return false
-		case <-ticker.C:
-			if rw.probeUpstream(probeInterval) {
+		case <-probeTimer.C:
+			if rw.probeUpstream(probeBase) {
 				return true
 			}
+			if rw.headUnsupported.Load() {
+				select {
+				case <-rw.ctx.Done():
+				case <-waitTimer.C:
+				}
+				return false
+			}
+			probeTimer.Reset(jitterRelayDelay(probeBase))
 		}
 	}
 }
 
 func (rw *relayWorker) probeUpstream(timeout time.Duration) bool {
+	if rw.headUnsupported.Load() {
+		return false
+	}
 	ctx, cancel := context.WithTimeout(rw.ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, rw.cfg.URL, nil)
@@ -212,7 +220,11 @@ func (rw *relayWorker) probeUpstream(timeout time.Duration) bool {
 		return false
 	}
 	_ = resp.Body.Close()
-	return resp.StatusCode < 500
+	if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotImplemented {
+		rw.headUnsupported.Store(true)
+		return false
+	}
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
 func (rw *relayWorker) watchIdleRead(body io.Closer, idleTimeout time.Duration, idleTimedOut *atomic.Bool, done <-chan struct{}) {
@@ -264,8 +276,13 @@ func (rw *relayWorker) resolvePassword() string {
 }
 
 func (rw *relayWorker) streamOnce() (bool, string) {
+	mountPath := rw.mount.Config().Path
+	redactedURL := redactRelayURL(rw.cfg.URL)
+	log := rw.mount.logger()
+
 	req, err := http.NewRequestWithContext(rw.ctx, http.MethodGet, rw.cfg.URL, nil)
 	if err != nil {
+		log.Debug("relay connect attempt failed", "mount", mountPath, "url", redactedURL, "reason", "invalid_request", "error", err)
 		return false, "invalid_request"
 	}
 
@@ -282,26 +299,29 @@ func (rw *relayWorker) streamOnce() (bool, string) {
 		if rw.ctx.Err() != nil {
 			return false, "shutdown"
 		}
+		reason := "connect_error"
 		if IsTimeoutError(err) {
-			return false, "connect_timeout"
+			reason = "connect_timeout"
 		}
-		return false, "connect_error"
+		log.Debug("relay connect attempt failed", "mount", mountPath, "url", redactedURL, "reason", reason, "error", err)
+		return false, reason
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		log.Debug("relay connect attempt failed", "mount", mountPath, "url", redactedURL, "reason", "bad_status", "status", resp.StatusCode)
 		return false, "bad_status"
 	}
 
 	if err := rw.mount.AcquireRelaySource(); err != nil {
 		// Another source (e.g. direct DJ) is already active
+		log.Debug("relay connect attempt skipped", "mount", mountPath, "url", redactedURL, "reason", "source_busy")
 		return false, "source_busy"
 	}
 	defer rw.mount.ReleaseSource()
 
-	mountPath := rw.mount.Config().Path
 	rw.mount.observer.RelayConnected(mountPath)
-	slog.Info("relay connected", "mount", mountPath, "url", rw.cfg.URL)
+	log.Info("relay connected", "mount", mountPath, "url", redactedURL)
 
 	rw.mount.SetSourceCloser(resp.Body)
 
@@ -332,7 +352,7 @@ func (rw *relayWorker) streamOnce() (bool, string) {
 		return nil
 	})
 
-	reason := "eof"
+	reason := "stream_error"
 	switch {
 	case idleTimedOut.Load():
 		reason = "idle_timeout"
@@ -342,11 +362,11 @@ func (rw *relayWorker) streamOnce() (bool, string) {
 		reason = "eof"
 	case IsTimeoutError(pumpErr):
 		reason = "read_timeout"
-	case pumpErr != nil:
-		reason = "stream_error"
+	case errors.Is(pumpErr, net.ErrClosed) || strings.Contains(pumpErr.Error(), "closed response body"):
+		reason = "preempted"
 	}
 
 	rw.mount.observer.RelayDisconnected(mountPath, reason)
-	slog.Info("relay disconnected", "mount", mountPath, "url", rw.cfg.URL, "reason", reason)
+	log.Info("relay disconnected", "mount", mountPath, "url", redactedURL, "reason", reason)
 	return streamed.Load(), reason
 }

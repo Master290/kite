@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -68,16 +69,24 @@ type Hub struct {
 	mu       sync.RWMutex
 	mounts   map[string]*Mount
 	observer Observer
+	log      *slog.Logger
 	ctx      context.Context
 	cancel   context.CancelFunc
 }
 
 func NewHub(cfg *config.Config, observer Observer) (*Hub, error) {
+	return NewHubWithLogger(cfg, observer, slog.Default())
+}
+
+func NewHubWithLogger(cfg *config.Config, observer Observer, logger *slog.Logger) (*Hub, error) {
 	if observer == nil {
 		observer = nopObserver{}
 	}
+	if logger == nil {
+		logger = slog.Default()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	h := &Hub{mounts: make(map[string]*Mount), observer: observer, ctx: ctx, cancel: cancel}
+	h := &Hub{mounts: make(map[string]*Mount), observer: observer, log: logger, ctx: ctx, cancel: cancel}
 	if err := h.Apply(cfg); err != nil {
 		cancel()
 		return nil, err
@@ -294,6 +303,13 @@ func newMount(parent context.Context, hub *Hub, cfg config.Mount, defaults confi
 	}
 	go m.run()
 	return m
+}
+
+func (m *Mount) logger() *slog.Logger {
+	if m != nil && m.hub != nil && m.hub.log != nil {
+		return m.hub.log
+	}
+	return slog.Default()
 }
 
 func (m *Mount) stop() {

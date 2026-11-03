@@ -658,3 +658,170 @@ func TestPrimarySwitchClearsFallbackTitle(t *testing.T) {
 		t.Fatalf("expected fallback title to be cleared to configured mount name, got %q", got)
 	}
 }
+
+func TestRelayHead405AndGet404GrowsBackoff(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		getTimes []time.Time
+		headHits atomic.Int32
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			headHits.Add(1)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		mu.Lock()
+		getTimes = append(getTimes, time.Now())
+		mu.Unlock()
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	baseDelay := 50 * time.Millisecond
+	mountCfg := config.Mount{
+		Path:           "/head405-get404",
+		Profile:        "mp3",
+		ContentType:    "audio/mpeg",
+		SourceTimeout:  config.Duration(250 * time.Millisecond),
+		BufferDuration: config.Duration(250 * time.Millisecond),
+		Relay: &config.RelayConfig{
+			URL:        server.URL,
+			RetryDelay: config.Duration(baseDelay),
+		},
+	}
+
+	h, err := NewHub(testConfig(mountCfg), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	// Wait for 4 GET attempts (~0ms, ~50ms, ~150ms, ~350ms).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(getTimes)
+		mu.Unlock()
+		if n >= 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for 4 GET attempts, got %d", n)
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	mu.Lock()
+	times := append([]time.Time(nil), getTimes[:4]...)
+	mu.Unlock()
+
+	gap1 := times[1].Sub(times[0]) // ~50ms (±20%: 40..60ms)
+	gap2 := times[2].Sub(times[1]) // ~100ms (±20%: 80..120ms)
+	gap3 := times[3].Sub(times[2]) // ~200ms (±20%: 160..240ms)
+
+	if gap2 <= gap1 || gap3 <= gap2 {
+		t.Fatalf("expected growing backoff gaps, got gap1=%v gap2=%v gap3=%v", gap1, gap2, gap3)
+	}
+	if gap3 < 140*time.Millisecond {
+		t.Fatalf("expected 3rd backoff gap >= 140ms (4x base w/ jitter), got %v", gap3)
+	}
+
+	// Verify probeUpstream semantics directly: 405/501 sets headUnsupported, 4xx is false, 2xx is true.
+	rw := &relayWorker{
+		ctx:    context.Background(),
+		cfg:    config.RelayConfig{URL: server.URL},
+		client: server.Client(),
+	}
+	if rw.probeUpstream(time.Second) {
+		t.Fatal("expected HEAD 405 to return false")
+	}
+	if !rw.headUnsupported.Load() {
+		t.Fatal("expected headUnsupported to be set after 405")
+	}
+	hitsBefore := headHits.Load()
+	if rw.probeUpstream(time.Second) {
+		t.Fatal("expected subsequent probe to be skipped when headUnsupported is true")
+	}
+	if headHits.Load() != hitsBefore {
+		t.Fatalf("expected no further HEAD requests after 405, got %d -> %d", hitsBefore, headHits.Load())
+	}
+}
+
+func TestRelayIdleTimeoutDoesNotResetBackoff(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		getTimes []time.Time
+	)
+
+	// Upstream returns 200 OK on GET but sends no audio bytes (upstream has no source).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		getTimes = append(getTimes, time.Now())
+		mu.Unlock()
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	idleTimeout := 60 * time.Millisecond
+	baseDelay := 50 * time.Millisecond
+	mountCfg := config.Mount{
+		Path:             "/idle-backoff",
+		Profile:          "mp3",
+		ContentType:      "audio/mpeg",
+		SourceTimeout:    config.Duration(250 * time.Millisecond),
+		BufferDuration:   config.Duration(250 * time.Millisecond),
+		RelayIdleTimeout: config.Duration(idleTimeout),
+		Relay: &config.RelayConfig{
+			URL:              server.URL,
+			RetryDelay:       config.Duration(baseDelay),
+			RelayIdleTimeout: config.Duration(idleTimeout),
+		},
+	}
+
+	h, err := NewHub(testConfig(mountCfg), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		n := len(getTimes)
+		mu.Unlock()
+		if n >= 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for 4 idle-timeout attempts, got %d", n)
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	mu.Lock()
+	times := append([]time.Time(nil), getTimes[:4]...)
+	mu.Unlock()
+
+	// Each attempt spends ~idleTimeout (60ms) connected plus growing backoff (~50ms, ~100ms, ~200ms).
+	cycle1 := times[1].Sub(times[0])
+	cycle2 := times[2].Sub(times[1])
+	cycle3 := times[3].Sub(times[2])
+
+	if cycle3 <= cycle1+80*time.Millisecond {
+		t.Fatalf("expected backoff to grow across idle_timeout cycles, got cycle1=%v cycle2=%v cycle3=%v", cycle1, cycle2, cycle3)
+	}
+}
+
+func TestRedactRelayURL(t *testing.T) {
+	got := redactRelayURL("https://user:supersecret@upstream.example.com:8443/live")
+	if got == "https://user:supersecret@upstream.example.com:8443/live" || bytes.Contains([]byte(got), []byte("supersecret")) {
+		t.Fatalf("expected password to be redacted, got %q", got)
+	}
+}

@@ -25,7 +25,7 @@ func NewMetrics() *Metrics {
 		bytesOut:         prometheus.NewCounterVec(prometheus.CounterOpts{Name: "kite_listener_bytes_total", Help: "Audio bytes sent to listeners."}, []string{"mount", "transport"}),
 		sources:          prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "kite_source_connected", Help: "Whether a source is connected."}, []string{"mount"}),
 		relayConnected:   prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "kite_relay_connected", Help: "Whether a relay upstream is connected."}, []string{"mount"}),
-		relayReconnects:  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "kite_relay_reconnects_total", Help: "Relay reconnects by reason."}, []string{"mount", "reason"}),
+		relayReconnects:  prometheus.NewCounterVec(prometheus.CounterOpts{Name: "kite_relay_reconnects_total", Help: "Relay reconnect cycles by reason (including failed connection attempts and stream disconnects)."}, []string{"mount", "reason"}),
 		disconnects:      prometheus.NewCounterVec(prometheus.CounterOpts{Name: "kite_listener_disconnects_total", Help: "Listener disconnects by reason."}, []string{"mount", "transport", "reason"}),
 		fallbackSwitches: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "kite_fallback_switches_total", Help: "Fallback source switches."}, []string{"mount", "target"}),
 		configRevision:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "kite_config_revision", Help: "Monotonic applied configuration revision."}),

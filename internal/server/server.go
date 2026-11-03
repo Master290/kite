@@ -69,7 +69,7 @@ func New(cfg *config.Config, configPath string, logger *slog.Logger) (*Server, e
 			return nil, err
 		}
 	}
-	hub, err := stream.NewHub(cfg, metrics)
+	hub, err := stream.NewHubWithLogger(cfg, metrics, logger)
 	if err != nil {
 		return nil, err
 	}
