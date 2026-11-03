@@ -365,7 +365,7 @@ func (s *Server) handleSource(w http.ResponseWriter, r *http.Request, m *stream.
 	}
 	defer m.ReleaseSource()
 	m.SetSourceStreamMetadata(s.parseSourceStreamMetadata(r))
-	s.log.Info("source connected", "mount", m.Config().Path, "method", r.Method, "proto", r.Proto, "content_length", r.ContentLength, "transfer_encoding", r.TransferEncoding, "expect", r.Header.Get("Expect"))
+	s.log.Info("source connected", "mount", m.Config().Path, "remote_ip", s.requestClientIP(r), "method", r.Method, "proto", r.Proto, "content_length", r.ContentLength, "transfer_encoding", r.TransferEncoding, "expect", r.Header.Get("Expect"))
 	if r.ProtoMajor == 1 && r.ContentLength == 0 && len(r.TransferEncoding) == 0 {
 		s.handleRawSource(w, r, m)
 		return
@@ -953,19 +953,24 @@ func (s *Server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		ip := s.requestClientIP(r)
 		limiter := s.getAuthLimiter()
-		if isLocked, wait, failures := limiter.checkLocked(ip); isLocked {
-			s.log.Warn("authentication rejected: IP locked out", "scope", "admin_api", "ip", ip, "token", "[REDACTED]", "failures", failures, "retry_after", wait.Round(time.Millisecond))
+		if isLocked, wait, failures := limiter.checkLocked(ip, "admin_api"); isLocked {
+			s.log.Warn("authentication rejected: IP locked out", "scope", "admin_api", "ip", ip, "token", "[REDACTED]", "failures", failures, "retry_after", wait.Round(time.Millisecond).String())
 			writeAuthLockout(w, wait)
 			return
 		}
-		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
-			failures, lockDelay := limiter.recordFailure(ip)
-			s.log.Warn("authentication failed", "scope", "admin_api", "ip", ip, "token", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond))
+		rawAuth := r.Header.Get("Authorization")
+		if strings.TrimSpace(rawAuth) == "" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		limiter.recordSuccess(ip)
+		got, hasBearer := strings.CutPrefix(rawAuth, "Bearer ")
+		if !hasBearer || subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			failures, lockDelay := limiter.recordFailure(ip, "admin_api")
+			s.log.Warn("authentication failed", "scope", "admin_api", "ip", ip, "token", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond).String(), "retry_after", lockDelay.Round(time.Millisecond).String())
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		limiter.recordSuccess(ip, "admin_api")
 		next(w, r)
 	}
 }

@@ -26,32 +26,75 @@ const (
 	defaultIcecastLoc    = "Earth"
 	defaultIcecastID     = "Icecast 2.4.4"
 
-	authLockoutThreshold = 5
-	defaultAuthBaseDelay = 2 * time.Second
-	maxAuthLockoutDelay  = 15 * time.Minute
+	authLockoutThreshold   = 5
+	globalLockoutThreshold = 15
+	defaultAuthBaseDelay   = 1 * time.Second
+	maxAuthLockoutDelay    = 15 * time.Minute
+	defaultAuthEntryTTL    = 30 * time.Minute
+	defaultAuthMaxEntries  = 100000
 )
 
 type authLimiter struct {
-	mu        sync.Mutex
-	ips       map[string]*ipAuthState
-	baseDelay time.Duration
-	maxDelay  time.Duration
-	nowFn     func() time.Time
+	mu         sync.Mutex
+	ips        map[string]*ipAuthState
+	lruHead    *ipAuthState
+	lruTail    *ipAuthState
+	baseDelay  time.Duration
+	maxDelay   time.Duration
+	ttl        time.Duration
+	maxEntries int
+	nowFn      func() time.Time
+}
+
+type scopeAuthState struct {
+	failures    int
+	lockedUntil time.Time
 }
 
 type ipAuthState struct {
-	failures     int
-	lockedUntil  time.Time
-	bcryptWindow time.Time
-	bcryptCount  int
+	ip                string
+	icecastAdmin      scopeAuthState
+	source            scopeAuthState
+	adminAPI          scopeAuthState
+	totalFailures     int
+	globalLockedUntil time.Time
+	lastLockout       time.Duration
+	lastSeen          time.Time
+	bcryptWindow      time.Time
+	bcryptCount       int
+	prev              *ipAuthState
+	next              *ipAuthState
+}
+
+func (st *ipAuthState) scopeState(scope string) *scopeAuthState {
+	switch scope {
+	case "icecast_admin":
+		return &st.icecastAdmin
+	case "admin_api":
+		return &st.adminAPI
+	default:
+		return &st.source
+	}
+}
+
+func (st *ipAuthState) latestLockedUntil() time.Time {
+	latest := st.globalLockedUntil
+	for _, t := range []time.Time{st.icecastAdmin.lockedUntil, st.source.lockedUntil, st.adminAPI.lockedUntil} {
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	return latest
 }
 
 func newAuthLimiter() *authLimiter {
 	return &authLimiter{
-		ips:       make(map[string]*ipAuthState),
-		baseDelay: defaultAuthBaseDelay,
-		maxDelay:  maxAuthLockoutDelay,
-		nowFn:     time.Now,
+		ips:        make(map[string]*ipAuthState),
+		baseDelay:  defaultAuthBaseDelay,
+		maxDelay:   maxAuthLockoutDelay,
+		ttl:        defaultAuthEntryTTL,
+		maxEntries: defaultAuthMaxEntries,
+		nowFn:      time.Now,
 	}
 }
 
@@ -62,30 +105,148 @@ func (l *authLimiter) now() time.Time {
 	return time.Now()
 }
 
-func (l *authLimiter) state(ip string) *ipAuthState {
+func (l *authLimiter) removeNode(st *ipAuthState) {
+	if st.prev != nil {
+		st.prev.next = st.next
+	} else if l.lruHead == st {
+		l.lruHead = st.next
+	}
+	if st.next != nil {
+		st.next.prev = st.prev
+	} else if l.lruTail == st {
+		l.lruTail = st.prev
+	}
+	st.prev = nil
+	st.next = nil
+}
+
+func (l *authLimiter) pushFront(st *ipAuthState) {
+	st.prev = nil
+	st.next = l.lruHead
+	if l.lruHead != nil {
+		l.lruHead.prev = st
+	}
+	l.lruHead = st
+	if l.lruTail == nil {
+		l.lruTail = st
+	}
+}
+
+func (l *authLimiter) touch(st *ipAuthState, now time.Time) {
+	st.lastSeen = now
+	if l.lruHead != st {
+		l.removeNode(st)
+		l.pushFront(st)
+	}
+}
+
+func (l *authLimiter) evictNode(st *ipAuthState) {
+	l.removeNode(st)
+	delete(l.ips, st.ip)
+}
+
+func (l *authLimiter) isExpired(st *ipAuthState, now time.Time) bool {
+	if now.Before(st.latestLockedUntil()) {
+		return false
+	}
+	ttl := l.ttl
+	if ttl <= 0 {
+		ttl = defaultAuthEntryTTL
+	}
+	if st.lastLockout > ttl {
+		ttl = st.lastLockout
+	}
+	return now.Sub(st.lastSeen) > ttl
+}
+
+func (l *authLimiter) evictExpiredLocked(now time.Time) {
+	ttl := l.ttl
+	if ttl <= 0 {
+		ttl = defaultAuthEntryTTL
+	}
+	for cur := l.lruTail; cur != nil; {
+		prev := cur.prev
+		if now.Sub(cur.lastSeen) <= ttl {
+			break
+		}
+		if l.isExpired(cur, now) {
+			l.evictNode(cur)
+		}
+		cur = prev
+	}
+}
+
+func (l *authLimiter) state(ip string, now time.Time) *ipAuthState {
 	if l.ips == nil {
 		l.ips = make(map[string]*ipAuthState)
 	}
 	st, ok := l.ips[ip]
-	if !ok {
-		st = &ipAuthState{}
-		l.ips[ip] = st
+	if ok {
+		l.touch(st, now)
+		return st
 	}
+	maxEntries := l.maxEntries
+	if maxEntries <= 0 {
+		maxEntries = defaultAuthMaxEntries
+	}
+	for len(l.ips) >= maxEntries && l.lruTail != nil {
+		l.evictNode(l.lruTail)
+	}
+	st = &ipAuthState{ip: ip, lastSeen: now}
+	l.ips[ip] = st
+	l.pushFront(st)
 	return st
 }
 
-func (l *authLimiter) checkLocked(ip string) (bool, time.Duration, int) {
+func (l *authLimiter) lockoutDelay(overThreshold int) time.Duration {
+	base := l.baseDelay
+	if base <= 0 {
+		base = defaultAuthBaseDelay
+	}
+	maxDelay := l.maxDelay
+	if maxDelay <= 0 {
+		maxDelay = maxAuthLockoutDelay
+	}
+	shift := overThreshold
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 12 {
+		shift = 12
+	}
+	delay := base << shift
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	return delay
+}
+
+func (l *authLimiter) checkLocked(ip, scope string) (bool, time.Duration, int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.now()
+	l.evictExpiredLocked(now)
 	st, ok := l.ips[ip]
 	if !ok {
 		return false, 0, 0
 	}
-	now := l.now()
-	if now.Before(st.lockedUntil) {
-		return true, st.lockedUntil.Sub(now), st.failures
+	sc := st.scopeState(scope)
+	var lockedUntil time.Time
+	failures := sc.failures
+	if now.Before(sc.lockedUntil) {
+		lockedUntil = sc.lockedUntil
 	}
-	return false, 0, st.failures
+	if now.Before(st.globalLockedUntil) && st.globalLockedUntil.After(lockedUntil) {
+		lockedUntil = st.globalLockedUntil
+		if st.totalFailures > failures {
+			failures = st.totalFailures
+		}
+	}
+	if !lockedUntil.IsZero() {
+		l.touch(st, now)
+		return true, lockedUntil.Sub(now), failures
+	}
+	return false, 0, failures
 }
 
 // allowBcrypt rate-limits bcrypt comparisons per IP before running the expensive
@@ -94,8 +255,9 @@ func (l *authLimiter) allowBcrypt(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	st := l.state(ip)
-	if now.Before(st.lockedUntil) {
+	l.evictExpiredLocked(now)
+	st := l.state(ip, now)
+	if now.Before(st.latestLockedUntil()) {
 		return false
 	}
 	if st.bcryptWindow.IsZero() || now.Sub(st.bcryptWindow) >= time.Second {
@@ -109,39 +271,62 @@ func (l *authLimiter) allowBcrypt(ip string) bool {
 	return true
 }
 
-func (l *authLimiter) recordFailure(ip string) (int, time.Duration) {
+func (l *authLimiter) recordFailure(ip, scope string) (int, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	st := l.state(ip)
-	st.failures++
-	if st.failures < authLockoutThreshold {
-		return st.failures, 0
+	l.evictExpiredLocked(now)
+	st := l.state(ip, now)
+	sc := st.scopeState(scope)
+	sc.failures++
+	st.totalFailures++
+
+	var scopeDelay time.Duration
+	if sc.failures >= authLockoutThreshold {
+		scopeDelay = l.lockoutDelay(sc.failures - authLockoutThreshold)
+		sc.lockedUntil = now.Add(scopeDelay)
 	}
-	base := l.baseDelay
-	if base <= 0 {
-		base = defaultAuthBaseDelay
+
+	var globalDelay time.Duration
+	if st.totalFailures >= globalLockoutThreshold {
+		globalDelay = l.lockoutDelay(st.totalFailures - globalLockoutThreshold)
+		st.globalLockedUntil = now.Add(globalDelay)
 	}
-	maxDelay := l.maxDelay
-	if maxDelay <= 0 {
-		maxDelay = maxAuthLockoutDelay
+
+	delay := scopeDelay
+	if globalDelay > delay {
+		delay = globalDelay
 	}
-	shift := st.failures - authLockoutThreshold
-	if shift > 12 {
-		shift = 12
+	if delay > st.lastLockout {
+		st.lastLockout = delay
 	}
-	delay := base << shift
-	if delay > maxDelay {
-		delay = maxDelay
-	}
-	st.lockedUntil = now.Add(delay)
-	return st.failures, delay
+	return sc.failures, delay
 }
 
-func (l *authLimiter) recordSuccess(ip string) {
+func (l *authLimiter) recordSuccess(ip, scope string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.ips, ip)
+	now := l.now()
+	l.evictExpiredLocked(now)
+	st, ok := l.ips[ip]
+	if !ok {
+		return
+	}
+	sc := st.scopeState(scope)
+	sc.failures = 0
+	sc.lockedUntil = time.Time{}
+	if st.icecastAdmin.failures == 0 && st.source.failures == 0 && st.adminAPI.failures == 0 && st.totalFailures == 0 {
+		l.evictNode(st)
+		return
+	}
+	l.touch(st, now)
+}
+
+func (l *authLimiter) len() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.evictExpiredLocked(l.now())
+	return len(l.ips)
 }
 
 func (s *Server) getAuthLimiter() *authLimiter {
@@ -231,42 +416,66 @@ func (s *Server) adminBasicAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func (s *Server) safeLogUsername(user, expectedUser string) string {
+	if user == "" {
+		return "[unknown]"
+	}
+	if expectedUser != "" && user == expectedUser {
+		return user
+	}
+	if user == s.icecastAdminUser() {
+		return user
+	}
+	if cfg := s.Config(); cfg != nil {
+		for _, m := range cfg.Mounts {
+			if m.Source.Username != "" && user == m.Source.Username {
+				return user
+			}
+		}
+	}
+	return "[unknown]"
+}
+
 func (s *Server) authenticateBasic(r *http.Request, scope, expectedUser, expectedPass string) (ok bool, locked bool, retryAfter time.Duration) {
 	ip := s.requestClientIP(r)
 	limiter := s.getAuthLimiter()
 	user, pass, hasBasic := r.BasicAuth()
-	if isLocked, wait, failures := limiter.checkLocked(ip); isLocked {
-		s.log.Warn("authentication rejected: IP locked out", "scope", scope, "ip", ip, "user", user, "password", "[REDACTED]", "failures", failures, "retry_after", wait.Round(time.Millisecond))
+	logUser := s.safeLogUsername(user, expectedUser)
+	if isLocked, wait, failures := limiter.checkLocked(ip, scope); isLocked {
+		s.log.Warn("authentication rejected: IP locked out", "scope", scope, "ip", ip, "user", logUser, "password", "[REDACTED]", "failures", failures, "retry_after", wait.Round(time.Millisecond).String())
 		return false, true, wait
 	}
+	if strings.TrimSpace(r.Header.Get("Authorization")) == "" {
+		return false, false, 0
+	}
 	if expectedPass == "" || !hasBasic || user != expectedUser {
-		failures, lockDelay := limiter.recordFailure(ip)
-		s.log.Warn("authentication failed", "scope", scope, "ip", ip, "user", user, "password", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond))
+		failures, lockDelay := limiter.recordFailure(ip, scope)
+		s.log.Warn("authentication failed", "scope", scope, "ip", ip, "user", logUser, "password", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond).String(), "retry_after", lockDelay.Round(time.Millisecond).String())
 		return false, false, 0
 	}
 	if strings.HasPrefix(expectedPass, "$2") {
 		if !limiter.allowBcrypt(ip) {
-			failures, lockDelay := limiter.recordFailure(ip)
+			failures, lockDelay := limiter.recordFailure(ip, scope)
 			if lockDelay == 0 {
 				lockDelay = time.Second
 			}
-			s.log.Warn("authentication rate-limited before bcrypt", "scope", scope, "ip", ip, "user", user, "password", "[REDACTED]", "failures", failures)
+			s.log.Warn("authentication rate-limited before bcrypt", "scope", scope, "ip", ip, "user", logUser, "password", "[REDACTED]", "failures", failures, "retry_after", lockDelay.Round(time.Millisecond).String())
 			return false, true, lockDelay
 		}
 		if bcrypt.CompareHashAndPassword([]byte(expectedPass), []byte(pass)) != nil {
-			failures, lockDelay := limiter.recordFailure(ip)
-			s.log.Warn("authentication failed", "scope", scope, "ip", ip, "user", user, "password", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond))
+			failures, lockDelay := limiter.recordFailure(ip, scope)
+			s.log.Warn("authentication failed", "scope", scope, "ip", ip, "user", logUser, "password", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond).String(), "retry_after", lockDelay.Round(time.Millisecond).String())
 			return false, false, 0
 		}
-		limiter.recordSuccess(ip)
+		limiter.recordSuccess(ip, scope)
 		return true, false, 0
 	}
 	if subtle.ConstantTimeCompare([]byte(expectedPass), []byte(pass)) != 1 {
-		failures, lockDelay := limiter.recordFailure(ip)
-		s.log.Warn("authentication failed", "scope", scope, "ip", ip, "user", user, "password", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond))
+		failures, lockDelay := limiter.recordFailure(ip, scope)
+		s.log.Warn("authentication failed", "scope", scope, "ip", ip, "user", logUser, "password", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond).String(), "retry_after", lockDelay.Round(time.Millisecond).String())
 		return false, false, 0
 	}
-	limiter.recordSuccess(ip)
+	limiter.recordSuccess(ip, scope)
 	return true, false, 0
 }
 
@@ -333,51 +542,65 @@ func remoteAddrIP(remoteAddr string) string {
 	return remoteAddr
 }
 
-func (s *Server) isTrustedProxy(remoteAddr string) bool {
+func (s *Server) isTrustedIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
 	cfg := s.Config()
 	if cfg == nil {
 		return false
 	}
-	entries := append(append([]string(nil), cfg.Server.TrustedProxies...), cfg.Server.TrustedProxyNetworks...)
-	if len(entries) == 0 {
-		return false
-	}
-	ip := net.ParseIP(remoteAddrIP(remoteAddr))
-	if ip == nil {
-		return false
-	}
-	for _, entry := range entries {
-		if _, cidr, err := net.ParseCIDR(entry); err == nil {
-			if cidr.Contains(ip) {
+	for _, list := range [][]string{cfg.Server.TrustedProxies, cfg.Server.TrustedProxyNetworks} {
+		for _, entry := range list {
+			if _, cidr, err := net.ParseCIDR(entry); err == nil {
+				if cidr.Contains(ip) {
+					return true
+				}
+				continue
+			}
+			if trustedIP := net.ParseIP(entry); trustedIP != nil && trustedIP.Equal(ip) {
 				return true
 			}
-			continue
-		}
-		if trustedIP := net.ParseIP(entry); trustedIP != nil && trustedIP.Equal(ip) {
-			return true
 		}
 	}
 	return false
+}
+
+func (s *Server) isTrustedProxy(remoteAddr string) bool {
+	return s.isTrustedIP(net.ParseIP(remoteAddrIP(remoteAddr)))
 }
 
 func (s *Server) requestClientIP(r *http.Request) string {
 	if r == nil {
 		return "127.0.0.1"
 	}
-	if s.isTrustedProxy(r.RemoteAddr) {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			for _, part := range strings.Split(xff, ",") {
-				candidate := strings.TrimSpace(part)
-				if net.ParseIP(candidate) != nil {
-					return candidate
+	remoteIPStr := remoteAddrIP(r.RemoteAddr)
+	if !s.isTrustedIP(net.ParseIP(remoteIPStr)) {
+		return remoteIPStr
+	}
+	if xffHeaders := r.Header.Values("X-Forwarded-For"); len(xffHeaders) > 0 {
+		for hIdx := len(xffHeaders) - 1; hIdx >= 0; hIdx-- {
+			parts := strings.Split(xffHeaders[hIdx], ",")
+			for i := len(parts) - 1; i >= 0; i-- {
+				candidate := strings.TrimSpace(parts[i])
+				ip := net.ParseIP(candidate)
+				if ip == nil {
+					continue
 				}
+				if s.isTrustedIP(ip) {
+					continue
+				}
+				return ip.String()
 			}
 		}
-		if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" && net.ParseIP(xrip) != nil {
-			return xrip
+		return remoteIPStr
+	}
+	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
+		if ip := net.ParseIP(xrip); ip != nil && !s.isTrustedIP(ip) {
+			return ip.String()
 		}
 	}
-	return remoteAddrIP(r.RemoteAddr)
+	return remoteIPStr
 }
 
 func firstForwardedValue(v string) string {
@@ -389,39 +612,29 @@ func firstForwardedValue(v string) string {
 
 func (s *Server) requestBaseURL(r *http.Request) string {
 	cfg := s.Config()
-	trusted := r != nil && s.isTrustedProxy(r.RemoteAddr)
-
-	if trusted {
-		xfProto := strings.ToLower(firstForwardedValue(r.Header.Get("X-Forwarded-Proto")))
-		xfHost := firstForwardedValue(r.Header.Get("X-Forwarded-Host"))
-		if xfHost != "" {
-			scheme := "http"
-			if xfProto == "https" || xfProto == "http" {
-				scheme = xfProto
-			} else if r.TLS != nil {
-				scheme = "https"
-			}
-			return scheme + "://" + xfHost
-		}
-	}
-
 	if cfg != nil && cfg.Server.PublicURL != "" {
 		return strings.TrimRight(cfg.Server.PublicURL, "/")
 	}
 
+	trusted := r != nil && s.isTrustedProxy(r.RemoteAddr)
 	scheme := "http"
+	if r != nil && (r.TLS != nil || (r.URL != nil && strings.EqualFold(r.URL.Scheme, "https"))) {
+		scheme = "https"
+	}
 	if trusted {
 		if xfProto := strings.ToLower(firstForwardedValue(r.Header.Get("X-Forwarded-Proto"))); xfProto == "https" || xfProto == "http" {
 			scheme = xfProto
-		} else if r != nil && r.TLS != nil {
-			scheme = "https"
 		}
-	} else if r != nil && r.TLS != nil {
-		scheme = "https"
 	}
 
 	if cfg != nil && cfg.Server.Hostname != "" {
 		return scheme + "://" + cfg.Server.Hostname
+	}
+
+	if trusted {
+		if xfHost := firstForwardedValue(r.Header.Get("X-Forwarded-Host")); xfHost != "" {
+			return scheme + "://" + xfHost
+		}
 	}
 
 	host := "localhost"
@@ -530,8 +743,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		st := m.Status()
-		meta := m.StreamMetadata()
-		if !st.Source || !meta.Public {
+		if !st.Source {
 			continue
 		}
 		items = append(items, s.buildJSONSource(r, m))
@@ -713,10 +925,13 @@ func (s *Server) handleAdminListMounts(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	for _, m := range mounts {
 		st := m.Status()
+		if !st.Source {
+			continue
+		}
 		meta := m.StreamMetadata()
 		streamStart := m.StreamStart()
 		var connectedSec int64
-		if st.Source && !streamStart.IsZero() {
+		if !streamStart.IsZero() {
 			connectedSec = int64(now.Sub(streamStart).Seconds())
 			if connectedSec < 0 {
 				connectedSec = 0

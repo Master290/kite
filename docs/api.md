@@ -46,12 +46,12 @@ Admin endpoints require `Authorization: Bearer <KITE_ADMIN_TOKEN>`.
 
 ### Icecast-compatible XML Admin API
 
-Kite also serves Icecast 2.4-compatible XML endpoints under `/admin/`, authenticated exclusively with HTTP Basic Auth using the separate Icecast admin credentials (`admin.icecast_admin_user`, default `admin`, and `admin.icecast_admin_password` / `admin.icecast_admin_password_env` / `admin.icecast_admin_password_file` / `KITE_ICECAST_ADMIN_PASSWORD`). The Bearer control-plane token (`KITE_ADMIN_TOKEN`) is never accepted on `/admin/*`, and Bearer authentication is never accepted on the public listener. Per-IP failed-authentication lockout applies to both admin and source endpoints (5 consecutive failures trigger exponential backoff up to 15 minutes).
+Kite also serves Icecast 2.4-compatible XML endpoints under `/admin/`, authenticated exclusively with HTTP Basic Auth using the separate Icecast admin credentials (`admin.icecast_admin_user`, default `admin`, and `admin.icecast_admin_password` / `admin.icecast_admin_password_env` / `admin.icecast_admin_password_file` / `KITE_ICECAST_ADMIN_PASSWORD`). The Bearer control-plane token (`KITE_ADMIN_TOKEN`) is never accepted on `/admin/*`, and Bearer authentication is never accepted on the public listener. Per-(IP, scope) failed-authentication lockout applies across `icecast_admin`, `source`, and `admin_api` endpoints (5 consecutive failures in a scope trigger exponential backoff starting at 1s up to 15 minutes; unauthenticated requests without an `Authorization` header are not counted as failures).
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `GET` | `/admin/stats` | Global and per-mount XML statistics (`<icestats>`) |
-| `GET` | `/admin/listmounts` | Connected/configured mounts (`<icestats><source mount="...">`) |
+| `GET` | `/admin/listmounts` | Mounts with a live source (`<icestats><source mount="...">`) |
 | `GET` | `/admin/listclients?mount=/radio` | Connected listeners for a mount (`<listener id="...">`) |
 | `GET`, `POST` | `/admin/killclient?mount=/radio&id=<id>` | Disconnect a specific listener by ID |
 | `GET`, `POST` | `/admin/killsource?mount=/radio` | Disconnect the active source on a mount (disconnects listeners if no fallback is configured) |

@@ -385,16 +385,22 @@ func TestStatusJSONMatchesIcecast24Schema(t *testing.T) {
 		t.Fatalf("explicit artist/title mismatch: %+v", srcExplicit)
 	}
 
-	// 4c) Add a second public mount: while offline, source must STILL be a single object.
+	// 4c) Add a second non-hidden mount with public:false (like ffmpeg default ice-public:0):
+	// while offline, source must STILL be a single object; when live, it MUST be included in status-json
+	// (only hidden:true excludes a live mount).
 	cfg := s.Config()
 	cfg.Mounts = append(cfg.Mounts, config.Mount{
 		Path:        "/jazz",
 		Profile:     "mp3",
 		ContentType: "audio/mpeg",
 		Source:      cfg.Mounts[0].Source,
-		Metadata:    config.Metadata{Name: "Jazz Channel", Genre: "Jazz", Bitrate: 160000, Public: true},
+		Metadata:    config.Metadata{Name: "Jazz Channel", Genre: "Jazz", Bitrate: 160000, Public: false, PublicSet: true},
 	})
 	s.applyConfig(cfg)
+
+	// Also make the hidden mount (/private) live to verify hidden:true is still excluded.
+	mPriv, _ := s.hub.Get("/private")
+	acquireTestSource(t, mPriv)
 
 	respOffline2, err := http.Get(ts.URL + "/status-json.xsl")
 	if err != nil {
@@ -404,12 +410,13 @@ func TestStatusJSONMatchesIcecast24Schema(t *testing.T) {
 	_ = json.NewDecoder(respOffline2.Body).Decode(&gotStillOne)
 	_ = respOffline2.Body.Close()
 	if _, ok := gotStillOne["icestats"].(map[string]any)["source"].(map[string]any); !ok {
-		t.Fatalf("expected offline mount /jazz to be excluded from status-json, got %T", gotStillOne["icestats"].(map[string]any)["source"])
+		t.Fatalf("expected offline mount /jazz and hidden mount /private to be excluded from status-json, got %T", gotStillOne["icestats"].(map[string]any)["source"])
 	}
 
-	// Now connect a live source to /jazz and verify source becomes a 2-element array.
+	// Now connect a live source (with ice-public:0) to /jazz and verify source becomes a 2-element array.
 	mJazz, _ := s.hub.Get("/jazz")
 	acquireTestSource(t, mJazz)
+	mJazz.SetSourceStreamMetadata(stream.SourceStreamMetadata{Public: false, PublicSet: true})
 
 	resp2, err := http.Get(ts.URL + "/status-json.xsl")
 	if err != nil {
@@ -538,8 +545,10 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
 		if !strings.HasPrefix(unauthResp.Header.Get("WWW-Authenticate"), "Basic ") {
 			t.Fatalf("GET %s WWW-Authenticate=%q", ep, unauthResp.Header.Get("WWW-Authenticate"))
 		}
-		// Reset limiter after checking unauthenticated requests.
-		s.getAuthLimiter().recordSuccess("127.0.0.1")
+	}
+	// Requests without an Authorization header must not be counted as failures.
+	if gotLen := s.getAuthLimiter().len(); gotLen != 0 {
+		t.Fatalf("unauthenticated requests without Authorization header should not record failures, got len=%d", gotLen)
 	}
 
 	// Start a live HTTP PUT source that stays open until killed via /admin/killsource.
@@ -629,10 +638,10 @@ func TestIcecastAdminXMLEndpoints(t *testing.T) {
 		t.Fatalf("/admin/stats offline /private=%+v", privStats)
 	}
 
-	// 5b) /admin/listmounts
+	// 5b) /admin/listmounts: must list ONLY mounts with a live source (1 mount /radio, omitting offline /private).
 	var gotMounts xmlListMounts
 	doAdminXML("/admin/listmounts", &gotMounts)
-	if len(gotMounts.Source) == 0 || gotMounts.Source[0].ContentType != "audio/mpeg" {
+	if len(gotMounts.Source) != 1 || gotMounts.Source[0].Mount != "/radio" || gotMounts.Source[0].ContentType != "audio/mpeg" {
 		t.Fatalf("/admin/listmounts=%+v", gotMounts)
 	}
 
@@ -761,7 +770,7 @@ func TestMountM3UAndXSPFPlaylists(t *testing.T) {
 		t.Fatalf("/radio.xspf parsed=%+v, want=%+v", gotXSPF, wantXSPF)
 	}
 
-	// Test configured hostname & trusted_proxies X-Forwarded-Proto / X-Forwarded-Host.
+	// Test URL priority: public_url > hostname > trusted X-Forwarded-Host > Host.
 	cfg := s.Config()
 	cfg.Server.Hostname = "stream.configured.example:8000"
 	s.applyConfig(cfg)
@@ -779,7 +788,41 @@ func TestMountM3UAndXSPFPlaylists(t *testing.T) {
 		t.Fatalf("expected configured hostname when proxy is untrusted, got %q", string(bodyUntrusted))
 	}
 
+	// Behind a trusted proxy: hostname still wins over X-Forwarded-Host, while X-Forwarded-Proto sets scheme.
 	cfg.Server.TrustedProxies = []string{"127.0.0.1/32", "::1/128"}
+	s.applyConfig(cfg)
+	reqHostnameOverXFH, _ := http.NewRequest(http.MethodGet, ts.URL+"/radio.m3u", nil)
+	reqHostnameOverXFH.Header.Set("X-Forwarded-Proto", "https")
+	reqHostnameOverXFH.Header.Set("X-Forwarded-Host", "edge.radio.example")
+	respHostnameOverXFH, err := http.DefaultClient.Do(reqHostnameOverXFH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyHostnameOverXFH, _ := io.ReadAll(respHostnameOverXFH.Body)
+	_ = respHostnameOverXFH.Body.Close()
+	if !strings.Contains(string(bodyHostnameOverXFH), "https://stream.configured.example:8000/radio\n") {
+		t.Fatalf("expected hostname to take precedence over trusted X-Forwarded-Host, got %q", string(bodyHostnameOverXFH))
+	}
+
+	// public_url wins over both hostname and trusted X-Forwarded-Host.
+	cfg.Server.PublicURL = "https://public.canonical.example:8443"
+	s.applyConfig(cfg)
+	reqPublicURL, _ := http.NewRequest(http.MethodGet, ts.URL+"/radio.m3u", nil)
+	reqPublicURL.Header.Set("X-Forwarded-Proto", "http")
+	reqPublicURL.Header.Set("X-Forwarded-Host", "edge.radio.example")
+	respPublicURL, err := http.DefaultClient.Do(reqPublicURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyPublicURL, _ := io.ReadAll(respPublicURL.Body)
+	_ = respPublicURL.Body.Close()
+	if !strings.Contains(string(bodyPublicURL), "https://public.canonical.example:8443/radio\n") {
+		t.Fatalf("expected public_url to take precedence over hostname and X-Forwarded-Host, got %q", string(bodyPublicURL))
+	}
+
+	// When public_url and hostname are unset, trusted X-Forwarded-Host wins over Host.
+	cfg.Server.PublicURL = ""
+	cfg.Server.Hostname = ""
 	s.applyConfig(cfg)
 	reqTrusted, _ := http.NewRequest(http.MethodGet, ts.URL+"/radio.m3u", nil)
 	reqTrusted.Header.Set("X-Forwarded-Proto", "https")
@@ -792,6 +835,14 @@ func TestMountM3UAndXSPFPlaylists(t *testing.T) {
 	_ = respTrusted.Body.Close()
 	if !strings.Contains(string(bodyTrusted), "https://edge.radio.example/radio\n") {
 		t.Fatalf("expected X-Forwarded-Proto/Host when behind trusted proxy, got %q", string(bodyTrusted))
+	}
+
+	// When X-Forwarded-Host is trusted and X-Forwarded-Proto is missing, keep the scheme of the actual connection (e.g. https on TLS).
+	tlsReq := newTestRequest(http.MethodGet, "https://internal.local/radio.m3u", nil)
+	tlsReq.RemoteAddr = "127.0.0.1:43210"
+	tlsReq.Header.Set("X-Forwarded-Host", "edge.radio.example")
+	if gotBase := s.requestBaseURL(tlsReq); gotBase != "https://edge.radio.example" {
+		t.Fatalf("expected TLS connection scheme to be preserved when X-Forwarded-Proto is missing, got %q", gotBase)
 	}
 
 	// Unknown mount playlists return 404.
@@ -852,12 +903,12 @@ func TestAuthSeparationAndLockout(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("Bearer admin token must be rejected on /admin/stats, got status=%d", resp.StatusCode)
 	}
-	limiter.recordSuccess("127.0.0.1")
+	limiter.recordSuccess("127.0.0.1", "icecast_admin")
 
 	// 7b) 5 failed attempts on /admin/stats return 401; 6th attempt returns 429 even with valid password.
 	for i := 1; i <= 5; i++ {
 		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
-		req.SetBasicAuth("admin", "wrong-secret-pass")
+		req.SetBasicAuth("accidental-secret-in-username", "wrong-secret-pass")
 		r, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -924,8 +975,174 @@ func TestAuthSeparationAndLockout(t *testing.T) {
 	if !strings.Contains(logs, "[REDACTED]") {
 		t.Fatalf("expected [REDACTED] in auth failure logs, got: %s", logs)
 	}
-	if strings.Contains(logs, "wrong-secret-pass") || strings.Contains(logs, "bad-source-pass") {
-		t.Fatalf("auth failure logs leaked plaintext password: %s", logs)
+	if !strings.Contains(logs, `"user":"[unknown]"`) {
+		t.Fatalf("expected unknown username to be logged as [unknown], got: %s", logs)
+	}
+	if !strings.Contains(logs, `"retry_after":"5s"`) {
+		t.Fatalf("expected retry_after to be logged as duration string \"5s\", got: %s", logs)
+	}
+	if strings.Contains(logs, "wrong-secret-pass") || strings.Contains(logs, "bad-source-pass") || strings.Contains(logs, "accidental-secret-in-username") {
+		t.Fatalf("auth failure logs leaked plaintext credentials: %s", logs)
+	}
+}
+
+// 7d) X-Forwarded-For right-to-left resolution (spoofed leftmost entry), per-(IP, scope) reset
+// isolation, no-credential requests not counted, Bearer prefix requirement, and TTL + LRU eviction.
+func TestAuthLimiterXFFRightToLeftAndPerScopeAndEviction(t *testing.T) {
+	s, ts := publicServer(t, func(cfg *config.Config) {
+		cfg.Server.TrustedProxies = []string{"127.0.0.1/32", "::1/128", "10.0.0.254/32"}
+	})
+
+	// 1. Unauthenticated requests (no Authorization header) must NOT increment failure counters.
+	for i := 0; i < 15; i++ {
+		resp, err := http.Get(ts.URL + "/admin/stats")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated request %d status=%d, want 401", i, resp.StatusCode)
+		}
+	}
+	if gotLen := s.getAuthLimiter().len(); gotLen != 0 {
+		t.Fatalf("expected 0 limiter entries after unauthenticated requests, got %d", gotLen)
+	}
+
+	// 2. XFF right-to-left resolution: rotating a spoofed leftmost XFF entry
+	// ("172.16.0.N, 10.0.0.1, 10.0.0.254") through trusted proxies (127.0.0.1 and 10.0.0.254)
+	// must resolve to the first untrusted IP from the right (10.0.0.1) and lock it out after 5 failures.
+	for i := 1; i <= 5; i++ {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+		req.Header.Set("X-Forwarded-For", "172.16.0."+itoa(i)+", 10.0.0.1, 10.0.0.254")
+		req.SetBasicAuth("admin", "wrong-pass")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("spoofed XFF attempt %d status=%d, want 401", i, resp.StatusCode)
+		}
+	}
+	// 6th attempt from 10.0.0.1 with a fresh spoofed leftmost IP must return 429 Too Many Requests.
+	reqSpoof6, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+	reqSpoof6.Header.Set("X-Forwarded-For", "172.16.0.99, 10.0.0.1, 10.0.0.254")
+	reqSpoof6.SetBasicAuth("admin", "icecast-admin")
+	respSpoof6, err := http.DefaultClient.Do(reqSpoof6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respSpoof6.Body.Close()
+	if respSpoof6.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 lockout for 10.0.0.1 despite spoofed leftmost XFF, got %d", respSpoof6.StatusCode)
+	}
+	// Another untrusted client IP (10.0.0.2) is unaffected.
+	reqOtherIP, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+	reqOtherIP.Header.Set("X-Forwarded-For", "198.51.100.7, 10.0.0.2")
+	reqOtherIP.SetBasicAuth("admin", "icecast-admin")
+	respOtherIP, err := http.DefaultClient.Do(reqOtherIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respOtherIP.Body.Close()
+	if respOtherIP.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for unaffected client IP 10.0.0.2, got %d", respOtherIP.StatusCode)
+	}
+	// Verify parseSourceStreamMetadata also records the right-to-left untrusted IP as SourceIP.
+	srcReq := newTestRequest(http.MethodPut, "http://radio.example/radio", nil)
+	srcReq.RemoteAddr = "127.0.0.1:54321"
+	srcReq.Header.Set("X-Forwarded-For", "172.16.0.88, 10.0.0.1, 10.0.0.254")
+	if gotIP := s.parseSourceStreamMetadata(srcReq).SourceIP; gotIP != "10.0.0.1" {
+		t.Fatalf("SourceIP=%q, want 10.0.0.1", gotIP)
+	}
+
+	// 3. Per-(IP, scope) isolation: interleaving 4 wrong icecast_admin guesses with 1 successful
+	// source auth on the same IP (10.0.0.50) must NOT reset the icecast_admin failure counter.
+	for i := 1; i <= 4; i++ {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+		req.Header.Set("X-Forwarded-For", "10.0.0.50")
+		req.SetBasicAuth("admin", "wrong")
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = r.Body.Close()
+		if r.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("admin guess %d status=%d, want 401", i, r.StatusCode)
+		}
+	}
+	// Successful source metadata update from the same IP 10.0.0.50:
+	reqSrcOK, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/metadata?mount=/radio&mode=updinfo&song=Interleaved", nil)
+	reqSrcOK.Header.Set("X-Forwarded-For", "10.0.0.50")
+	reqSrcOK.SetBasicAuth("source", "source")
+	respSrcOK, err := http.DefaultClient.Do(reqSrcOK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respSrcOK.Body.Close()
+	if respSrcOK.StatusCode != http.StatusOK {
+		t.Fatalf("source metadata update status=%d, want 200", respSrcOK.StatusCode)
+	}
+	// 5th wrong admin guess from 10.0.0.50 reaches threshold, and 6th attempt returns 429!
+	reqAdmin5, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+	reqAdmin5.Header.Set("X-Forwarded-For", "10.0.0.50")
+	reqAdmin5.SetBasicAuth("admin", "wrong")
+	respAdmin5, err := http.DefaultClient.Do(reqAdmin5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respAdmin5.Body.Close()
+	if respAdmin5.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("admin guess 5 status=%d, want 401", respAdmin5.StatusCode)
+	}
+	reqAdmin6, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+	reqAdmin6.Header.Set("X-Forwarded-For", "10.0.0.50")
+	reqAdmin6.SetBasicAuth("admin", "icecast-admin")
+	respAdmin6, err := http.DefaultClient.Do(reqAdmin6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respAdmin6.Body.Close()
+	if respAdmin6.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on 6th admin attempt after interleaved source success, got %d", respAdmin6.StatusCode)
+	}
+
+	// 4. Admin API requires "Bearer " prefix (rejects raw token without prefix).
+	adminMux := http.NewServeMux()
+	s.registerAdmin(adminMux)
+	rawTokenReq := newTestRequest(http.MethodGet, "http://admin/api/v1/mounts", nil)
+	rawTokenReq.Header.Set("Authorization", "admin")
+	rawTokenRec := newTestRecorder()
+	adminMux.ServeHTTP(rawTokenRec, rawTokenReq)
+	if rawTokenRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when Bearer prefix is missing on /api/v1/mounts, got %d", rawTokenRec.Code)
+	}
+
+	// 5. Eviction: TTL expiration and LRU hard cap.
+	lim := newAuthLimiter()
+	lim.ttl = 30 * time.Minute
+	lim.maxEntries = 10
+	now := time.Now()
+	lim.nowFn = func() time.Time { return now }
+
+	for i := 1; i <= 15; i++ {
+		lim.recordFailure("192.0.2."+itoa(i), "source")
+	}
+	if got := lim.len(); got != 10 {
+		t.Fatalf("expected LRU cap to bound limiter at 10 entries, got %d", got)
+	}
+	// First 5 entries (192.0.2.1..5) should have been evicted by LRU; 192.0.2.6..15 remain.
+	if _, _, failures := lim.checkLocked("192.0.2.1", "source"); failures != 0 {
+		t.Fatalf("expected 192.0.2.1 to be LRU-evicted, got failures=%d", failures)
+	}
+	if _, _, failures := lim.checkLocked("192.0.2.15", "source"); failures != 1 {
+		t.Fatalf("expected 192.0.2.15 to remain in limiter, got failures=%d", failures)
+	}
+
+	// Advance clock past TTL (31 minutes) and verify all idle entries are evicted.
+	now = now.Add(31 * time.Minute)
+	if got := lim.len(); got != 0 {
+		t.Fatalf("expected all idle entries to be TTL-evicted after 31m, got %d", got)
 	}
 }
 
