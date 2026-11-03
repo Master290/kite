@@ -248,6 +248,7 @@ type Mount struct {
 	eventID        uint64
 	source         bool
 	isRelay        bool
+	disconnecting  bool
 	sourceSince    time.Time
 	lastSource     time.Time
 	active         string
@@ -338,8 +339,23 @@ func (m *Mount) relayIdleTimeout() time.Duration {
 	return 10 * time.Second
 }
 
+func (m *Mount) relayMaxBackoff() time.Duration {
+	cfg, defaults := m.settings()
+	if cfg.Relay != nil && cfg.Relay.RelayMaxBackoff.Duration() > 0 {
+		return cfg.Relay.RelayMaxBackoff.Duration()
+	}
+	if cfg.RelayMaxBackoff.Duration() > 0 {
+		return cfg.RelayMaxBackoff.Duration()
+	}
+	if defaults.RelayMaxBackoff.Duration() > 0 {
+		return defaults.RelayMaxBackoff.Duration()
+	}
+	return 10 * time.Second
+}
+
 func (m *Mount) Update(cfg config.Mount, defaults config.Defaults) {
 	oldIdle := m.relayIdleTimeout()
+	oldMaxBackoff := m.relayMaxBackoff()
 	m.cfgMu.Lock()
 	oldRelay := m.cfg.Relay
 	m.cfg = cfg
@@ -347,7 +363,7 @@ func (m *Mount) Update(cfg config.Mount, defaults config.Defaults) {
 	m.cfgMu.Unlock()
 
 	if cfg.Relay != nil {
-		if oldRelay == nil || *oldRelay != *cfg.Relay || oldIdle != m.relayIdleTimeout() {
+		if oldRelay == nil || *oldRelay != *cfg.Relay || oldIdle != m.relayIdleTimeout() || oldMaxBackoff != m.relayMaxBackoff() {
 			m.startRelay(*cfg.Relay)
 		}
 	} else if oldRelay != nil {
@@ -364,8 +380,9 @@ func (m *Mount) AcquireSource() error {
 
 	m.mu.Lock()
 	stale := m.source && !m.isRelay && !m.lastSource.IsZero() && time.Since(m.lastSource) > timeout
-	if (m.source && m.isRelay) || stale {
+	if (m.source && m.isRelay) || m.disconnecting || stale {
 		closer := m.sourceCloser
+		m.disconnecting = true
 		m.mu.Unlock()
 		if closer != nil {
 			_ = closer.Close()
@@ -386,6 +403,7 @@ func (m *Mount) AcquireSource() error {
 	m.mu.Lock()
 	m.source = true
 	m.isRelay = false
+	m.disconnecting = false
 	m.sourceSince = time.Now()
 	m.lastSource = m.sourceSince
 	m.primaryMeta = Metadata{}
@@ -397,11 +415,17 @@ func (m *Mount) AcquireSource() error {
 }
 
 func (m *Mount) AcquireRelaySource() error {
+	return m.acquireRelaySourceWithCloser(nil)
+}
+
+func (m *Mount) acquireRelaySourceWithCloser(closer io.Closer) error {
 	select {
 	case m.sourceGuard <- struct{}{}:
 		m.mu.Lock()
 		m.source = true
 		m.isRelay = true
+		m.disconnecting = false
+		m.sourceCloser = closer
 		m.sourceSince = time.Now()
 		m.lastSource = m.sourceSince
 		m.primaryMeta = Metadata{}
@@ -416,14 +440,16 @@ func (m *Mount) AcquireRelaySource() error {
 }
 
 func (m *Mount) ReleaseSource() {
+	m.mu.Lock()
 	select {
 	case <-m.sourceGuard:
 	default:
+		m.mu.Unlock()
 		return
 	}
-	m.mu.Lock()
 	m.source = false
 	m.isRelay = false
+	m.disconnecting = false
 	m.sourceCloser = nil
 	m.mu.Unlock()
 	m.observer.SourceDisconnected(m.Config().Path)
@@ -437,12 +463,27 @@ func (m *Mount) SetSourceCloser(closer io.Closer) {
 }
 
 func (m *Mount) DisconnectSource() bool {
-	m.mu.RLock()
+	return m.disconnectSource(false)
+}
+
+func (m *Mount) disconnectStaleSource() bool {
+	return m.disconnectSource(true)
+}
+
+func (m *Mount) disconnectSource(stale bool) bool {
+	m.mu.Lock()
 	closer := m.sourceCloser
 	connected := m.source
-	m.mu.RUnlock()
 	if !connected || closer == nil {
+		m.mu.Unlock()
 		return false
+	}
+	m.disconnecting = true
+	m.mu.Unlock()
+	if stale {
+		if ic, ok := closer.(interface{ closeIdleTimeout() error }); ok {
+			return ic.closeIdleTimeout() == nil
+		}
 	}
 	return closer.Close() == nil
 }
@@ -692,7 +733,7 @@ func (m *Mount) run() {
 				staleTimeout = m.relayIdleTimeout()
 			}
 			if connected && !last.IsZero() && staleTimeout > 0 && time.Since(last) >= staleTimeout {
-				m.DisconnectSource()
+				m.disconnectStaleSource()
 			}
 			stableSince = time.Time{}
 			desired := m.desiredFallback(cfg)

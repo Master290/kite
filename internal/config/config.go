@@ -88,6 +88,7 @@ type Defaults struct {
 	WriteInterval        Duration `yaml:"write_interval" json:"write_interval"`
 	ListenerWriteTimeout Duration `yaml:"listener_write_timeout" json:"listener_write_timeout"`
 	RelayIdleTimeout     Duration `yaml:"relay_idle_timeout" json:"relay_idle_timeout"`
+	RelayMaxBackoff      Duration `yaml:"relay_max_backoff" json:"relay_max_backoff"`
 	ICYMetaInterval      int      `yaml:"icy_meta_interval" json:"icy_meta_interval"`
 	MaxSourceBitrate     int      `yaml:"max_source_bitrate" json:"max_source_bitrate"`
 }
@@ -106,6 +107,7 @@ type Mount struct {
 	BufferDuration       Duration         `yaml:"buffer_duration,omitempty" json:"buffer_duration,omitempty"`
 	ListenerWriteTimeout Duration         `yaml:"listener_write_timeout,omitempty" json:"listener_write_timeout,omitempty"`
 	RelayIdleTimeout     Duration         `yaml:"relay_idle_timeout,omitempty" json:"relay_idle_timeout,omitempty"`
+	RelayMaxBackoff      Duration         `yaml:"relay_max_backoff,omitempty" json:"relay_max_backoff,omitempty"`
 	ICYMetaInterval      int              `yaml:"icy_meta_interval,omitempty" json:"icy_meta_interval,omitempty"`
 	CORSOrigins          []string         `yaml:"cors_origins,omitempty" json:"cors_origins,omitempty"`
 }
@@ -118,6 +120,7 @@ type RelayConfig struct {
 	PasswordFile     string   `yaml:"password_file,omitempty" json:"password_file,omitempty"`
 	RetryDelay       Duration `yaml:"retry_delay,omitempty" json:"retry_delay,omitempty"`
 	RelayIdleTimeout Duration `yaml:"relay_idle_timeout,omitempty" json:"relay_idle_timeout,omitempty"`
+	RelayMaxBackoff  Duration `yaml:"relay_max_backoff,omitempty" json:"relay_max_backoff,omitempty"`
 }
 
 type SourceCredential struct {
@@ -166,6 +169,7 @@ func Default() Config {
 			WriteInterval:        Duration(100 * time.Millisecond),
 			ListenerWriteTimeout: Duration(10 * time.Second),
 			RelayIdleTimeout:     Duration(10 * time.Second),
+			RelayMaxBackoff:      Duration(10 * time.Second),
 			ICYMetaInterval:      16000,
 			MaxSourceBitrate:     512000,
 		},
@@ -257,6 +261,12 @@ func (c *Config) Normalize(baseDir string) error {
 	}
 	if c.Defaults.RelayIdleTimeout < 0 {
 		return errors.New("relay_idle_timeout must be positive")
+	}
+	if c.Defaults.RelayMaxBackoff == 0 {
+		c.Defaults.RelayMaxBackoff = Duration(10 * time.Second)
+	}
+	if c.Defaults.RelayMaxBackoff < 0 {
+		return errors.New("relay_max_backoff must be positive")
 	}
 	if c.Defaults.ICYMetaInterval == 0 {
 		c.Defaults.ICYMetaInterval = 16000
@@ -419,12 +429,24 @@ func normalizeMount(m *Mount, d Defaults, baseDir string) error {
 	if m.RelayIdleTimeout <= 0 {
 		return errors.New("relay_idle_timeout must be positive")
 	}
+	if m.RelayMaxBackoff == 0 {
+		m.RelayMaxBackoff = d.RelayMaxBackoff
+	}
+	if m.RelayMaxBackoff <= 0 {
+		return errors.New("relay_max_backoff must be positive")
+	}
 	if m.Relay != nil {
 		if m.Relay.RelayIdleTimeout == 0 {
 			m.Relay.RelayIdleTimeout = m.RelayIdleTimeout
 		}
 		if m.Relay.RelayIdleTimeout <= 0 {
 			return errors.New("relay_idle_timeout must be positive")
+		}
+		if m.Relay.RelayMaxBackoff == 0 {
+			m.Relay.RelayMaxBackoff = m.RelayMaxBackoff
+		}
+		if m.Relay.RelayMaxBackoff <= 0 {
+			return errors.New("relay_max_backoff must be positive")
 		}
 	}
 	if m.ICYMetaInterval == 0 {

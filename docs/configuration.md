@@ -47,6 +47,7 @@ mounts:
       username: relay_user        # optional
       password_env: RELAY_PASS    # or password, or password_file
       retry_delay: 3s             # default: 3s
+      relay_max_backoff: 10s      # default: 10s (cap on jittered exponential reconnect backoff)
       relay_idle_timeout: 10s     # default: 10s (disconnect & reconnect if upstream goes silent)
 ```
 

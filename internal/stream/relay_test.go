@@ -326,8 +326,15 @@ func TestRelayWorkerDirectDJPriority(t *testing.T) {
 		}
 	}
 
-	// Direct DJ disconnects existing source (the relay)
+	// Direct DJ disconnects existing source (the relay) and waits for it to detach
 	m.DisconnectSource()
+	for m.Status().Source {
+		select {
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for relay source to detach")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
 
 	// Direct DJ acquires source
 	if err := m.AcquireSource(); err != nil {
@@ -480,15 +487,16 @@ func TestRelayInternalSubscriberExcludedFromPublicListeners(t *testing.T) {
 func TestRelayBackoffJitterAndCap(t *testing.T) {
 	base := 100 * time.Millisecond
 	for i := 0; i < 50; i++ {
-		got := jitterRelayDelay(base)
+		got := jitterRelayDelay(base, defaultMaxRelayBackoff)
 		if got < 80*time.Millisecond || got > 120*time.Millisecond {
-			t.Fatalf("jitterRelayDelay(%v) = %v, want within [80ms, 120ms]", base, got)
+			t.Fatalf("jitterRelayDelay(%v, 10s) = %v, want within [80ms, 120ms]", base, got)
 		}
 	}
+	// Verify default 10s cap: 3s -> 6s -> 10s (jittered in [8s, 10s]).
 	for i := 0; i < 50; i++ {
-		got := jitterRelayDelay(60 * time.Second)
-		if got < 24*time.Second || got > 30*time.Second {
-			t.Fatalf("jitterRelayDelay(60s) = %v, want within [24s, 30s]", got)
+		got := jitterRelayDelay(12*time.Second, defaultMaxRelayBackoff)
+		if got < 8*time.Second || got > 10*time.Second {
+			t.Fatalf("jitterRelayDelay(12s, 10s) = %v, want within [8s, 10s]", got)
 		}
 	}
 }
@@ -504,9 +512,6 @@ func TestRelayFastRecoveryAfterOutageAndMetrics(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "audio/mpeg")
 		w.WriteHeader(http.StatusOK)
-		if r.Method == http.MethodHead {
-			return
-		}
 		flusher, _ := w.(http.Flusher)
 		for {
 			if _, err := w.Write(frame); err != nil {
@@ -518,22 +523,28 @@ func TestRelayFastRecoveryAfterOutageAndMetrics(t *testing.T) {
 			select {
 			case <-r.Context().Done():
 				return
-			case <-time.After(15 * time.Millisecond):
+			case <-time.After(10 * time.Millisecond):
 			}
 		}
 	}))
 	defer server.Close()
 
+	// Scaled 1:100 to production defaults (retry_delay=30ms ~ 3s, relay_max_backoff=100ms ~ 10s).
+	// Source appearing 150ms (~15s) after outage start must be picked up within ~100ms (~10s).
+	baseDelay := 30 * time.Millisecond
+	maxBackoff := 100 * time.Millisecond
 	obs := &recordingRelayObserver{reasons: make(map[string]int)}
 	mountCfg := config.Mount{
-		Path:           "/outage-relay",
-		Profile:        "mp3",
-		ContentType:    "audio/mpeg",
-		SourceTimeout:  config.Duration(250 * time.Millisecond),
-		BufferDuration: config.Duration(250 * time.Millisecond),
+		Path:            "/outage-relay",
+		Profile:         "mp3",
+		ContentType:     "audio/mpeg",
+		SourceTimeout:   config.Duration(250 * time.Millisecond),
+		BufferDuration:  config.Duration(250 * time.Millisecond),
+		RelayMaxBackoff: config.Duration(maxBackoff),
 		Relay: &config.RelayConfig{
-			URL:        server.URL,
-			RetryDelay: config.Duration(40 * time.Millisecond),
+			URL:             server.URL,
+			RetryDelay:      config.Duration(baseDelay),
+			RelayMaxBackoff: config.Duration(maxBackoff),
 		},
 	}
 
@@ -548,24 +559,18 @@ func TestRelayFastRecoveryAfterOutageAndMetrics(t *testing.T) {
 		t.Fatal("mount not found")
 	}
 
-	// Let several failed attempts accumulate so backoff grows.
-	deadline := time.Now().Add(2 * time.Second)
-	for obs.reconnectCount("bad_status") < 3 {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for failed attempts, got %d", obs.reconnectCount("bad_status"))
-		}
-		time.Sleep(15 * time.Millisecond)
-	}
+	// Wait 150ms (1.5x maxBackoff, equivalent to 15s at 10s max_backoff) while upstream has no source.
+	time.Sleep(150 * time.Millisecond)
 
-	// Bring upstream back online and assert fast recovery via probe/backoff reset.
+	// Source appears on upstream; must be picked up within ~maxBackoff (100ms + jitter/connect margin).
 	recoveredStart := time.Now()
 	available.Store(true)
 
 	for !m.Status().Source {
-		if time.Since(recoveredStart) > 400*time.Millisecond {
-			t.Fatalf("relay took too long to recover after outage: %v", time.Since(recoveredStart))
+		if time.Since(recoveredStart) > 150*time.Millisecond {
+			t.Fatalf("relay took too long to pick up source after outage: %v (want <= ~%v)", time.Since(recoveredStart), maxBackoff)
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 	if obs.connected.Load() < 1 {
 		t.Fatal("expected RelayConnected observer callback")
@@ -679,16 +684,20 @@ func TestRelayHead405AndGet404GrowsBackoff(t *testing.T) {
 	}))
 	defer server.Close()
 
-	baseDelay := 50 * time.Millisecond
+	// Scaled 1:100 to default 3s base / 10s cap: 30ms -> 60ms -> 100ms (capped at 100ms).
+	baseDelay := 30 * time.Millisecond
+	maxBackoff := 100 * time.Millisecond
 	mountCfg := config.Mount{
-		Path:           "/head405-get404",
-		Profile:        "mp3",
-		ContentType:    "audio/mpeg",
-		SourceTimeout:  config.Duration(250 * time.Millisecond),
-		BufferDuration: config.Duration(250 * time.Millisecond),
+		Path:            "/head405-get404",
+		Profile:         "mp3",
+		ContentType:     "audio/mpeg",
+		SourceTimeout:   config.Duration(250 * time.Millisecond),
+		BufferDuration:  config.Duration(250 * time.Millisecond),
+		RelayMaxBackoff: config.Duration(maxBackoff),
 		Relay: &config.RelayConfig{
-			URL:        server.URL,
-			RetryDelay: config.Duration(baseDelay),
+			URL:             server.URL,
+			RetryDelay:      config.Duration(baseDelay),
+			RelayMaxBackoff: config.Duration(maxBackoff),
 		},
 	}
 
@@ -698,54 +707,40 @@ func TestRelayHead405AndGet404GrowsBackoff(t *testing.T) {
 	}
 	defer h.Close()
 
-	// Wait for 4 GET attempts (~0ms, ~50ms, ~150ms, ~350ms).
+	// Wait for 5 GET attempts (~0ms, +30ms, +60ms, +100ms, +100ms).
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		mu.Lock()
 		n := len(getTimes)
 		mu.Unlock()
-		if n >= 4 {
+		if n >= 5 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for 4 GET attempts, got %d", n)
+			t.Fatalf("timed out waiting for 5 GET attempts, got %d", n)
 		}
-		time.Sleep(15 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	mu.Lock()
-	times := append([]time.Time(nil), getTimes[:4]...)
+	times := append([]time.Time(nil), getTimes[:5]...)
 	mu.Unlock()
 
-	gap1 := times[1].Sub(times[0]) // ~50ms (±20%: 40..60ms)
-	gap2 := times[2].Sub(times[1]) // ~100ms (±20%: 80..120ms)
-	gap3 := times[3].Sub(times[2]) // ~200ms (±20%: 160..240ms)
+	gap1 := times[1].Sub(times[0]) // ~30ms (±20%: 24..36ms)
+	gap3 := times[3].Sub(times[2]) // ~100ms cap (±20%: 80..100ms)
+	gap4 := times[4].Sub(times[3]) // ~100ms cap (±20%: 80..100ms)
 
-	if gap2 <= gap1 || gap3 <= gap2 {
-		t.Fatalf("expected growing backoff gaps, got gap1=%v gap2=%v gap3=%v", gap1, gap2, gap3)
+	if gap3 <= gap1 {
+		t.Fatalf("expected backoff to grow from gap1=%v to capped gap3=%v", gap1, gap3)
 	}
-	if gap3 < 140*time.Millisecond {
-		t.Fatalf("expected 3rd backoff gap >= 140ms (4x base w/ jitter), got %v", gap3)
+	if gap3 < 70*time.Millisecond || gap3 > 130*time.Millisecond {
+		t.Fatalf("expected 3rd backoff gap near 100ms cap, got %v", gap3)
 	}
-
-	// Verify probeUpstream semantics directly: 405/501 sets headUnsupported, 4xx is false, 2xx is true.
-	rw := &relayWorker{
-		ctx:    context.Background(),
-		cfg:    config.RelayConfig{URL: server.URL},
-		client: server.Client(),
+	if gap4 < 70*time.Millisecond || gap4 > 130*time.Millisecond {
+		t.Fatalf("expected 4th backoff gap to stay capped near 100ms, got %v", gap4)
 	}
-	if rw.probeUpstream(time.Second) {
-		t.Fatal("expected HEAD 405 to return false")
-	}
-	if !rw.headUnsupported.Load() {
-		t.Fatal("expected headUnsupported to be set after 405")
-	}
-	hitsBefore := headHits.Load()
-	if rw.probeUpstream(time.Second) {
-		t.Fatal("expected subsequent probe to be skipped when headUnsupported is true")
-	}
-	if headHits.Load() != hitsBefore {
-		t.Fatalf("expected no further HEAD requests after 405, got %d -> %d", hitsBefore, headHits.Load())
+	if headHits.Load() != 0 {
+		t.Fatalf("expected 0 HEAD requests, got %d", headHits.Load())
 	}
 }
 
@@ -755,7 +750,7 @@ func TestRelayIdleTimeoutDoesNotResetBackoff(t *testing.T) {
 		getTimes []time.Time
 	)
 
-	// Upstream returns 200 OK on GET but sends no audio bytes (upstream has no source).
+	// Kite-without-source upstream: returns 200 OK on GET but sends no audio bytes.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		getTimes = append(getTimes, time.Now())
@@ -769,23 +764,29 @@ func TestRelayIdleTimeoutDoesNotResetBackoff(t *testing.T) {
 	}))
 	defer server.Close()
 
-	idleTimeout := 60 * time.Millisecond
-	baseDelay := 50 * time.Millisecond
+	// Use SourceTimeout=25ms so hub stale detection (at 50ms) and relay watchdog (50ms)
+	// both exercise the idle_timeout classification without resetting backoff.
+	idleTimeout := 50 * time.Millisecond
+	baseDelay := 30 * time.Millisecond
+	maxBackoff := 100 * time.Millisecond
+	obs := &recordingRelayObserver{reasons: make(map[string]int)}
 	mountCfg := config.Mount{
 		Path:             "/idle-backoff",
 		Profile:          "mp3",
 		ContentType:      "audio/mpeg",
-		SourceTimeout:    config.Duration(250 * time.Millisecond),
+		SourceTimeout:    config.Duration(25 * time.Millisecond),
 		BufferDuration:   config.Duration(250 * time.Millisecond),
 		RelayIdleTimeout: config.Duration(idleTimeout),
+		RelayMaxBackoff:  config.Duration(maxBackoff),
 		Relay: &config.RelayConfig{
 			URL:              server.URL,
 			RetryDelay:       config.Duration(baseDelay),
 			RelayIdleTimeout: config.Duration(idleTimeout),
+			RelayMaxBackoff:  config.Duration(maxBackoff),
 		},
 	}
 
-	h, err := NewHub(testConfig(mountCfg), nil)
+	h, err := NewHub(testConfig(mountCfg), obs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -802,20 +803,25 @@ func TestRelayIdleTimeoutDoesNotResetBackoff(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for 4 idle-timeout attempts, got %d", n)
 		}
-		time.Sleep(15 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	mu.Lock()
 	times := append([]time.Time(nil), getTimes[:4]...)
 	mu.Unlock()
 
-	// Each attempt spends ~idleTimeout (60ms) connected plus growing backoff (~50ms, ~100ms, ~200ms).
+	// Each attempt spends ~idleTimeout (50ms) connected plus growing backoff (~30ms, ~60ms, ~100ms cap).
 	cycle1 := times[1].Sub(times[0])
-	cycle2 := times[2].Sub(times[1])
 	cycle3 := times[3].Sub(times[2])
 
-	if cycle3 <= cycle1+80*time.Millisecond {
-		t.Fatalf("expected backoff to grow across idle_timeout cycles, got cycle1=%v cycle2=%v cycle3=%v", cycle1, cycle2, cycle3)
+	if cycle3 <= cycle1+35*time.Millisecond {
+		t.Fatalf("expected backoff to grow to ~cap across idle_timeout cycles, got cycle1=%v cycle3=%v", cycle1, cycle3)
+	}
+	if obs.reconnectCount("idle_timeout") < 3 {
+		t.Fatalf("expected disconnects to be classified as idle_timeout, got reasons=%v", obs.reasons)
+	}
+	if obs.reconnectCount("preempted") != 0 {
+		t.Fatalf("expected hub stale detection not to classify as preempted, got reasons=%v", obs.reasons)
 	}
 }
 
