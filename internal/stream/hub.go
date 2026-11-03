@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,9 +18,33 @@ import (
 	"github.com/Master290/kite/internal/config"
 )
 
+const DefaultBurstBytes = 65536
+
 var ErrSourceBusy = errors.New("source already connected")
 var ErrSlowListener = errors.New("listener fell behind the live buffer")
 var ErrSubscriptionClosed = errors.New("listener subscription closed")
+
+type SourceStreamMetadata struct {
+	Name        string
+	Description string
+	Genre       string
+	URL         string
+	Bitrate     int
+	Public      bool
+	PublicSet   bool
+	AudioInfo   string
+	SourceIP    string
+	ContentType string
+}
+
+type ClientInfo struct {
+	ID          uint64
+	IP          string
+	UserAgent   string
+	ConnectedAt time.Time
+	Transport   string
+	LagBytes    int
+}
 
 type Event struct {
 	ID      uint64         `json:"id"`
@@ -125,17 +151,35 @@ func (h *Hub) Get(path string) (*Mount, bool) {
 	return m, ok
 }
 
-func (h *Hub) Status() []Status {
+func (h *Hub) Mounts() []*Mount {
 	h.mu.RLock()
-	items := make([]Status, 0, len(h.mounts))
+	mounts := make([]*Mount, 0, len(h.mounts))
 	for _, m := range h.mounts {
-		items = append(items, m.Status())
+		mounts = append(mounts, m)
 	}
 	h.mu.RUnlock()
+	sort.Slice(mounts, func(i, j int) bool {
+		return mounts[i].Config().Path < mounts[j].Config().Path
+	})
+	return mounts
+}
+
+func (h *Hub) Status() []Status {
+	mounts := h.Mounts()
+	items := make([]Status, 0, len(mounts))
+	for _, m := range mounts {
+		items = append(items, m.Status())
+	}
 	return items
 }
 
 type internalSubscriberKey struct{}
+type listenerClientInfoKey struct{}
+
+type listenerClientInfo struct {
+	ip        string
+	userAgent string
+}
 
 // WithInternalSubscriber marks a context as originating from an internal
 // relay or fallback subscriber so it is excluded from public listener counts.
@@ -149,6 +193,11 @@ func IsInternalSubscriber(ctx context.Context) bool {
 	return v
 }
 
+// WithListenerClientInfo attaches the connecting listener's IP address and User-Agent.
+func WithListenerClientInfo(ctx context.Context, ip, userAgent string) context.Context {
+	return context.WithValue(ctx, listenerClientInfoKey{}, listenerClientInfo{ip: ip, userAgent: userAgent})
+}
+
 type subscription struct {
 	mount     *Mount
 	id        uint64
@@ -156,7 +205,21 @@ type subscription struct {
 	internal  bool
 }
 
+func (s subscription) ID() uint64          { return s.id }
 func (s subscription) Close(reason string) { s.mount.removeListener(s.id, reason) }
+
+func (s subscription) HasBuffered() bool {
+	s.mount.mu.RLock()
+	defer s.mount.mu.RUnlock()
+	listener, ok := s.mount.listeners[s.id]
+	if !ok {
+		return false
+	}
+	if listener.preludeIndex < len(listener.prelude) {
+		return true
+	}
+	return len(s.mount.ring) > 0 && listener.cursor <= s.mount.sequence
+}
 
 func (s subscription) Next(ctx context.Context) (Chunk, error) {
 	path := s.mount.Config().Path
@@ -211,9 +274,13 @@ func (s subscription) RecordWrite(n int) {
 }
 
 type listener struct {
+	id           uint64
 	cursor       uint64
 	transport    string
 	internal     bool
+	ip           string
+	userAgent    string
+	connectedAt  time.Time
 	prelude      [][]byte
 	preludeIndex int
 }
@@ -234,30 +301,34 @@ type Mount struct {
 	defaults config.Defaults
 
 	primary chan ingest
+	syncCh  chan chan struct{}
 
-	mu             sync.RWMutex
-	listeners      map[uint64]*listener
-	eventSubs      map[uint64]chan Event
-	eventHistory   []Event
-	nextID         uint64
-	sequence       uint64
-	ring           []Chunk
-	ringFirst      uint64
-	ringBytes      int
-	notify         chan struct{}
-	eventID        uint64
-	source         bool
-	isRelay        bool
-	disconnecting  bool
-	sourceSince    time.Time
-	lastSource     time.Time
-	active         string
-	metadata       Metadata
-	primaryMeta    Metadata
-	fallbackTitled bool
-	bytesIn        uint64
-	bytesOut       uint64
-	initChunks     [][]byte
+	mu               sync.RWMutex
+	listeners        map[uint64]*listener
+	listenerPeak     int
+	eventSubs        map[uint64]chan Event
+	eventHistory     []Event
+	nextID           uint64
+	sequence         uint64
+	ring             []Chunk
+	ringFirst        uint64
+	ringBytes        int
+	notify           chan struct{}
+	eventID          uint64
+	createdAt        time.Time
+	source           bool
+	isRelay          bool
+	disconnecting    bool
+	sourceSince      time.Time
+	lastSource       time.Time
+	active           string
+	metadata         Metadata
+	primaryMeta      Metadata
+	sourceStreamMeta SourceStreamMetadata
+	fallbackTitled   bool
+	bytesIn          uint64
+	bytesOut         uint64
+	initChunks       [][]byte
 
 	sourceGuard  chan struct{}
 	sourceCloser io.Closer
@@ -289,15 +360,17 @@ type Status struct {
 
 func newMount(parent context.Context, hub *Hub, cfg config.Mount, defaults config.Defaults, observer Observer) *Mount {
 	ctx, cancel := context.WithCancel(parent)
+	now := time.Now()
 	m := &Mount{
 		hub: hub, observer: observer, ctx: ctx, cancel: cancel, cfg: cfg, defaults: defaults,
-		primary: make(chan ingest, 256), listeners: make(map[uint64]*listener),
+		primary: make(chan ingest, 256), syncCh: make(chan chan struct{}), listeners: make(map[uint64]*listener),
 		eventSubs: make(map[uint64]chan Event), sourceGuard: make(chan struct{}, 1), active: "silence", notify: make(chan struct{}),
+		createdAt: now,
 	}
 	m.eventID = 2
 	m.eventHistory = []Event{
-		{ID: 1, Type: "source", Mount: cfg.Path, Time: time.Now(), Payload: map[string]any{"connected": false, "active": "silence"}},
-		{ID: 2, Type: "metadata", Mount: cfg.Path, Time: time.Now(), Payload: map[string]any{"title": "", "url": ""}},
+		{ID: 1, Type: "source", Mount: cfg.Path, Time: now, Payload: map[string]any{"connected": false, "active": "silence"}},
+		{ID: 2, Type: "metadata", Mount: cfg.Path, Time: now, Payload: map[string]any{"title": "", "url": ""}},
 	}
 	if cfg.Relay != nil {
 		m.startRelay(*cfg.Relay)
@@ -553,7 +626,126 @@ func (m *Mount) setDefaultPrimaryTitle(title string) {
 	m.mu.Unlock()
 }
 
+func (m *Mount) SetSourceStreamMetadata(meta SourceStreamMetadata) {
+	m.mu.Lock()
+	m.sourceStreamMeta = meta
+	m.mu.Unlock()
+}
+
+func (m *Mount) StreamMetadata() config.Metadata {
+	cfg := m.Config()
+	m.mu.RLock()
+	src := m.sourceStreamMeta
+	m.mu.RUnlock()
+
+	out := cfg.Metadata
+	if out.Name == "" {
+		out.Name = src.Name
+	}
+	if out.Description == "" {
+		out.Description = src.Description
+	}
+	if out.Genre == "" {
+		out.Genre = src.Genre
+	}
+	if out.URL == "" {
+		out.URL = src.URL
+	}
+	if out.Bitrate <= 0 {
+		out.Bitrate = src.Bitrate
+	}
+	if !cfg.Metadata.PublicSet && !cfg.Metadata.Public && src.PublicSet {
+		out.Public = src.Public
+	}
+	return out
+}
+
+func (m *Mount) SourceAudioInfo() string {
+	m.mu.RLock()
+	info := m.sourceStreamMeta.AudioInfo
+	m.mu.RUnlock()
+	if info != "" {
+		return info
+	}
+	if br := m.StreamMetadata().Bitrate; br > 0 {
+		return fmt.Sprintf("bitrate=%d", br)
+	}
+	return ""
+}
+
+func (m *Mount) SourceIP() string {
+	m.mu.RLock()
+	ip := m.sourceStreamMeta.SourceIP
+	m.mu.RUnlock()
+	if ip != "" {
+		return ip
+	}
+	return "127.0.0.1"
+}
+
+func (m *Mount) StreamStart() time.Time {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.sourceSince.IsZero() {
+		return m.sourceSince
+	}
+	return m.createdAt
+}
+
+func (m *Mount) ListenerPeak() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.listenerPeak
+}
+
+func (m *Mount) ListClients() []ClientInfo {
+	m.mu.RLock()
+	out := make([]ClientInfo, 0, len(m.listeners))
+	for id, l := range m.listeners {
+		if l.internal {
+			continue
+		}
+		lag := 0
+		if len(m.ring) > 0 && l.cursor <= m.sequence && l.cursor >= m.ringFirst {
+			for idx := l.cursor - m.ringFirst; idx < uint64(len(m.ring)); idx++ {
+				lag += len(m.ring[idx].Data)
+			}
+		}
+		out = append(out, ClientInfo{
+			ID:          id,
+			IP:          l.ip,
+			UserAgent:   l.userAgent,
+			ConnectedAt: l.connectedAt,
+			Transport:   l.transport,
+			LagBytes:    lag,
+		})
+	}
+	m.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+func (m *Mount) KillClient(id uint64) bool {
+	path := m.Config().Path
+	m.mu.Lock()
+	listener, ok := m.listeners[id]
+	if !ok || listener.internal {
+		m.mu.Unlock()
+		return false
+	}
+	delete(m.listeners, id)
+	oldNotify := m.notify
+	m.notify = make(chan struct{})
+	close(oldNotify)
+	m.mu.Unlock()
+	m.observer.ListenerClosed(path, listener.transport, "killed")
+	return true
+}
+
 func (m *Mount) restorePrimaryMetadata(cfg config.Mount) {
+	streamName := m.StreamMetadata().Name
 	m.mu.Lock()
 	if !m.fallbackTitled {
 		m.mu.Unlock()
@@ -561,7 +753,7 @@ func (m *Mount) restorePrimaryMetadata(cfg config.Mount) {
 	}
 	md := m.primaryMeta
 	if md.Title == "" {
-		md.Title = cfg.Metadata.Name
+		md.Title = streamName
 	}
 	m.metadata = md
 	m.fallbackTitled = false
@@ -571,19 +763,41 @@ func (m *Mount) restorePrimaryMetadata(cfg config.Mount) {
 
 func (m *Mount) Metadata() Metadata { m.mu.RLock(); defer m.mu.RUnlock(); return m.metadata }
 
+func (m *Mount) flushPrimary() {
+	done := make(chan struct{})
+	select {
+	case m.syncCh <- done:
+		select {
+		case <-done:
+		case <-m.ctx.Done():
+		}
+	case <-m.ctx.Done():
+	}
+}
+
 func (m *Mount) Subscribe(transport string) subscription {
-	return m.subscribe(transport, false)
+	return m.subscribe(context.Background(), transport, false)
 }
 
 func (m *Mount) SubscribeInternal(transport string) subscription {
-	return m.subscribe(transport, true)
+	return m.subscribe(context.Background(), transport, true)
 }
 
 func (m *Mount) SubscribeContext(ctx context.Context, transport string) subscription {
-	return m.subscribe(transport, IsInternalSubscriber(ctx))
+	return m.subscribe(ctx, transport, IsInternalSubscriber(ctx))
 }
 
-func (m *Mount) subscribe(transport string, internal bool) subscription {
+func (m *Mount) subscribe(ctx context.Context, transport string, internal bool) subscription {
+	m.flushPrimary()
+	cfg, defaults := m.settings()
+	var clientInfo listenerClientInfo
+	if ctx != nil {
+		clientInfo, _ = ctx.Value(listenerClientInfoKey{}).(listenerClientInfo)
+	}
+	if clientInfo.ip == "" {
+		clientInfo.ip = "127.0.0.1"
+	}
+
 	m.mu.Lock()
 	m.nextID++
 	id := m.nextID
@@ -591,13 +805,103 @@ func (m *Mount) subscribe(transport string, internal bool) subscription {
 	for i := range m.initChunks {
 		prelude[i] = append([]byte(nil), m.initChunks[i]...)
 	}
-	l := &listener{cursor: m.sequence + 1, transport: transport, internal: internal, prelude: prelude}
+	cursor, prelude := m.initListenerCursorLocked(cfg, defaults, prelude)
+	l := &listener{
+		id:          id,
+		cursor:      cursor,
+		transport:   transport,
+		internal:    internal,
+		ip:          clientInfo.ip,
+		userAgent:   clientInfo.userAgent,
+		connectedAt: time.Now(),
+		prelude:     prelude,
+	}
 	m.listeners[id] = l
+	if !internal {
+		publicCount := 0
+		for _, cur := range m.listeners {
+			if !cur.internal {
+				publicCount++
+			}
+		}
+		if publicCount > m.listenerPeak {
+			m.listenerPeak = publicCount
+		}
+	}
 	m.mu.Unlock()
 	if !internal {
-		m.observer.ListenerOpened(m.Config().Path, transport)
+		m.observer.ListenerOpened(cfg.Path, transport)
 	}
 	return subscription{mount: m, id: id, transport: transport, internal: internal}
+}
+
+func (m *Mount) initListenerCursorLocked(cfg config.Mount, defaults config.Defaults, prelude [][]byte) (uint64, [][]byte) {
+	if len(m.ring) == 0 {
+		return m.sequence + 1, prelude
+	}
+	target := burstBytes(cfg, defaults)
+	if target <= 0 {
+		return m.sequence + 1, prelude
+	}
+
+	accum := 0
+	startIdx := len(m.ring)
+	for i := len(m.ring) - 1; i >= 0; i-- {
+		data := m.ring[i].Data
+		chunkLen := len(data)
+		if accum+chunkLen <= target {
+			accum += chunkLen
+			startIdx = i
+			if accum == target {
+				break
+			}
+			continue
+		}
+		rem := target - accum
+		if rem > 0 && chunkLen > rem {
+			tail := data[chunkLen-rem:]
+			if off := findFrameBoundary(cfg.Profile, tail); off >= 0 && (off > 0 || findFrameBoundary(cfg.Profile, data) != 0) {
+				prelude = append(prelude, append([]byte(nil), tail[off:]...))
+				return m.ring[i].Sequence + 1, prelude
+			}
+		}
+		if startIdx == len(m.ring) {
+			startIdx = i
+		}
+		break
+	}
+
+	if startIdx >= len(m.ring) {
+		return m.sequence + 1, prelude
+	}
+
+	off := findFrameBoundary(cfg.Profile, m.ring[startIdx].Data)
+	if off == 0 {
+		return m.ring[startIdx].Sequence, prelude
+	}
+	if off > 0 {
+		prelude = append(prelude, append([]byte(nil), m.ring[startIdx].Data[off:]...))
+		return m.ring[startIdx].Sequence + 1, prelude
+	}
+	for j := startIdx + 1; j < len(m.ring); j++ {
+		if jOff := findFrameBoundary(cfg.Profile, m.ring[j].Data); jOff == 0 {
+			return m.ring[j].Sequence, prelude
+		} else if jOff > 0 {
+			prelude = append(prelude, append([]byte(nil), m.ring[j].Data[jOff:]...))
+			return m.ring[j].Sequence + 1, prelude
+		}
+	}
+	return m.ring[startIdx].Sequence, prelude
+}
+
+func burstBytes(cfg config.Mount, defaults config.Defaults) int {
+	if cfg.BurstBytes > 0 {
+		return cfg.BurstBytes
+	}
+	if defaults.BurstBytes > 0 {
+		return defaults.BurstBytes
+	}
+	return DefaultBurstBytes
 }
 
 func bufferBytes(cfg config.Mount, defaults config.Defaults) int {
@@ -612,6 +916,10 @@ func bufferBytes(cfg config.Mount, defaults config.Defaults) int {
 	bytes := int(float64(bitrate) / 8 * dur.Seconds())
 	if bytes < 16<<10 {
 		bytes = 16 << 10
+	}
+	burst := burstBytes(cfg, defaults)
+	if bytes < burst && (cfg.BurstBytes > 0 || cfg.Metadata.Bitrate == 0 || cfg.Metadata.Bitrate >= 64000) {
+		bytes = burst
 	}
 	if bytes > 64<<20 {
 		bytes = 64 << 20
@@ -677,6 +985,34 @@ func (m *Mount) run() {
 	var fallback <-chan []byte
 	var fallbackCancel context.CancelFunc
 	var stableSince time.Time
+	handlePrimary := func(in ingest) {
+		cfg := m.Config()
+		m.mu.RLock()
+		sourceSince := m.sourceSince
+		active := m.active
+		m.mu.RUnlock()
+		if stableSince.IsZero() {
+			stableSince = sourceSince
+		}
+		if active == "primary" || active == "silence" || time.Since(stableSince) >= cfg.FailbackDelay.Duration() {
+			if active != "primary" {
+				if fallbackCancel != nil {
+					fallbackCancel()
+					fallbackCancel = nil
+					fallback = nil
+				}
+				previous := active
+				m.setActive("primary")
+				m.restorePrimaryMetadata(cfg)
+				if previous != "silence" && cfg.Profile == "ogg-opus" {
+					for _, init := range m.InitialChunks() {
+						m.broadcast(init, time.Now())
+					}
+				}
+			}
+			m.broadcast(in.data, in.at)
+		}
+	}
 	for {
 		select {
 		case <-m.ctx.Done():
@@ -686,31 +1022,17 @@ func (m *Mount) run() {
 			m.closeListeners("shutdown")
 			return
 		case in := <-m.primary:
-			cfg := m.Config()
-			m.mu.RLock()
-			sourceSince := m.sourceSince
-			active := m.active
-			m.mu.RUnlock()
-			if stableSince.IsZero() {
-				stableSince = sourceSince
-			}
-			if active == "primary" || active == "silence" || time.Since(stableSince) >= cfg.FailbackDelay.Duration() {
-				if active != "primary" {
-					if fallbackCancel != nil {
-						fallbackCancel()
-						fallbackCancel = nil
-						fallback = nil
-					}
-					previous := active
-					m.setActive("primary")
-					m.restorePrimaryMetadata(cfg)
-					if previous != "silence" && cfg.Profile == "ogg-opus" {
-						for _, init := range m.InitialChunks() {
-							m.broadcast(init, time.Now())
-						}
-					}
+			handlePrimary(in)
+		case done := <-m.syncCh:
+		drainLoop:
+			for {
+				select {
+				case in := <-m.primary:
+					handlePrimary(in)
+				default:
+					close(done)
+					break drainLoop
 				}
-				m.broadcast(in.data, in.at)
 			}
 		case data, ok := <-fallback:
 			if !ok {
@@ -904,15 +1226,18 @@ func (m *Mount) setActive(active string) {
 
 func (m *Mount) broadcast(data []byte, at time.Time) {
 	cfg, defaults := m.settings()
-	m.mu.Lock()
-	m.sequence++
-	chunk := Chunk{Sequence: m.sequence, Data: data, At: at}
-	if len(m.ring) == 0 {
-		m.ringFirst = m.sequence
-	}
-	m.ring = append(m.ring, chunk)
-	m.ringBytes += len(data)
+	parts := splitFramesForRing(cfg.Profile, data)
 	maxBytes := bufferBytes(cfg, defaults)
+	m.mu.Lock()
+	for _, part := range parts {
+		m.sequence++
+		chunk := Chunk{Sequence: m.sequence, Data: part, At: at}
+		if len(m.ring) == 0 {
+			m.ringFirst = m.sequence
+		}
+		m.ring = append(m.ring, chunk)
+		m.ringBytes += len(part)
+	}
 	for m.ringBytes > maxBytes && len(m.ring) > 1 {
 		m.ringBytes -= len(m.ring[0].Data)
 		m.ring[0] = Chunk{}
@@ -923,6 +1248,163 @@ func (m *Mount) broadcast(data []byte, at time.Time) {
 	m.notify = make(chan struct{})
 	close(oldNotify)
 	m.mu.Unlock()
+}
+
+func splitFramesForRing(profile string, data []byte) [][]byte {
+	switch profile {
+	case "mp3":
+		if len(data) >= 4 && data[0] == 0xff && data[1]&0xe0 == 0xe0 {
+			if l, err := mp3FrameLength(data[:4]); err == nil && l == len(data) {
+				return [][]byte{data}
+			}
+		}
+		var parts [][]byte
+		pos := 0
+		if len(data) >= 10 && string(data[:3]) == "ID3" {
+			size := 10 + synchsafe(data[6:10])
+			if size <= len(data) {
+				parts = append(parts, data[:size])
+				pos = size
+			}
+		}
+		for pos < len(data) {
+			off := findFrameBoundary("mp3", data[pos:])
+			if off < 0 {
+				break
+			}
+			if off > 0 {
+				parts = append(parts, data[pos:pos+off])
+				pos += off
+			}
+			if pos+4 > len(data) {
+				break
+			}
+			l, err := mp3FrameLength(data[pos : pos+4])
+			if err != nil || pos+l > len(data) {
+				break
+			}
+			parts = append(parts, data[pos:pos+l])
+			pos += l
+		}
+		if len(parts) == 0 {
+			return [][]byte{data}
+		}
+		if pos < len(data) {
+			parts = append(parts, data[pos:])
+		}
+		return parts
+	case "aac-adts":
+		if len(data) >= 7 && data[0] == 0xff && data[1]&0xf6 == 0xf0 {
+			l := int(data[3]&3)<<11 | int(data[4])<<3 | int(data[5]>>5)
+			if l == len(data) {
+				return [][]byte{data}
+			}
+		}
+		var parts [][]byte
+		pos := 0
+		for pos < len(data) {
+			off := findFrameBoundary("aac-adts", data[pos:])
+			if off < 0 {
+				break
+			}
+			if off > 0 {
+				parts = append(parts, data[pos:pos+off])
+				pos += off
+			}
+			if pos+7 > len(data) {
+				break
+			}
+			l := int(data[pos+3]&3)<<11 | int(data[pos+4])<<3 | int(data[pos+5]>>5)
+			if l < 7 || l > maxFrameSize || pos+l > len(data) {
+				break
+			}
+			parts = append(parts, data[pos:pos+l])
+			pos += l
+		}
+		if len(parts) == 0 {
+			return [][]byte{data}
+		}
+		if pos < len(data) {
+			parts = append(parts, data[pos:])
+		}
+		return parts
+	case "ogg-opus":
+		var parts [][]byte
+		pos := 0
+		for pos < len(data) {
+			off := findFrameBoundary("ogg-opus", data[pos:])
+			if off < 0 {
+				break
+			}
+			if off > 0 {
+				parts = append(parts, data[pos:pos+off])
+				pos += off
+			}
+			if pos+27 > len(data) {
+				break
+			}
+			segs := int(data[pos+26])
+			if pos+27+segs > len(data) {
+				break
+			}
+			size := 27 + segs
+			for _, v := range data[pos+27 : pos+27+segs] {
+				size += int(v)
+			}
+			if size > maxFrameSize || pos+size > len(data) {
+				break
+			}
+			parts = append(parts, data[pos:pos+size])
+			pos += size
+		}
+		if len(parts) == 0 {
+			return [][]byte{data}
+		}
+		if pos < len(data) {
+			parts = append(parts, data[pos:])
+		}
+		return parts
+	default:
+		return [][]byte{data}
+	}
+}
+
+func findFrameBoundary(profile string, b []byte) int {
+	switch profile {
+	case "mp3":
+		if len(b) >= 3 && string(b[:3]) == "ID3" {
+			return 0
+		}
+		for i := 0; i+4 <= len(b); i++ {
+			if b[i] == 0xff && b[i+1]&0xe0 == 0xe0 {
+				l, err := mp3FrameLength(b[i : i+4])
+				if err != nil {
+					continue
+				}
+				if i+l >= len(b) || (i+l+2 <= len(b) && b[i+l] == 0xff && b[i+l+1]&0xe0 == 0xe0) {
+					return i
+				}
+			}
+		}
+		return -1
+	case "aac-adts":
+		for i := 0; i+7 <= len(b); i++ {
+			if b[i] == 0xff && b[i+1]&0xf6 == 0xf0 {
+				l := int(b[i+3]&3)<<11 | int(b[i+4])<<3 | int(b[i+5]>>5)
+				if l < 7 || l > maxFrameSize {
+					continue
+				}
+				if i+l >= len(b) || (i+l+2 <= len(b) && b[i+l] == 0xff && b[i+l+1]&0xf6 == 0xf0) {
+					return i
+				}
+			}
+		}
+		return -1
+	case "ogg-opus":
+		return bytes.Index(b, []byte("OggS"))
+	default:
+		return 0
+	}
 }
 
 func (m *Mount) closeListeners(reason string) {
@@ -977,6 +1459,7 @@ func IsTimeoutError(err error) bool {
 
 func Copy(ctx context.Context, dst io.Writer, sub subscription) error {
 	defer sub.Close("client_closed")
+	flusher, _ := dst.(interface{ Flush() error })
 	for {
 		chunk, err := sub.Next(ctx)
 		if err != nil {
@@ -989,6 +1472,14 @@ func Copy(ctx context.Context, dst io.Writer, sub subscription) error {
 				sub.Close("write_timeout")
 			}
 			return err
+		}
+		if flusher != nil && !sub.HasBuffered() {
+			if err := flusher.Flush(); err != nil {
+				if IsTimeoutError(err) {
+					sub.Close("write_timeout")
+				}
+				return err
+			}
 		}
 	}
 }

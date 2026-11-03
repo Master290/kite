@@ -11,8 +11,10 @@
 | `GET /_kite/v1/events?mount=/radio` | SSE metadata/source events |
 | `GET /_kite/v1/ws?mount=/radio` | WebSocket audio and JSON events |
 | `GET /_kite/v1/playlist.m3u?mount=/radio` | Absolute M3U playlist |
+| `GET /radio.m3u` | Icecast-compatible M3U playlist |
+| `GET /radio.xspf` | Icecast-compatible XSPF playlist |
 | `GET /`, `/index.html`, `/status.xsl` | Built-in HTML status and player page |
-| `GET /status-json.xsl` | Mount status JSON |
+| `GET /status-json.xsl` | Icecast 2.4-compatible `icestats` JSON |
 | `GET /radio.m3u8` | Live HLS playlist for MP3 and AAC mounts |
 | `GET /radio.hls/<seq>.ts` | Immutable HLS MPEG-TS segment |
 | `GET /healthz` | Process health on the admin listener |
@@ -24,7 +26,9 @@ Mounts with the `mp3` or `aac-adts` profile are packaged into live HLS streams w
 
 ## Source ingest
 
-Source clients authenticate with HTTP Basic Auth using the configured mount username and password. Kite accepts `PUT /radio`, `POST /radio`, and legacy `SOURCE /radio ICE/1.0` over HTTP/1.1. The media profile must match the mount configuration.
+Source clients authenticate with HTTP Basic Auth using the configured mount username and password. Kite accepts `PUT /radio`, `POST /radio`, and legacy `SOURCE /radio ICE/1.0` over HTTP/1.1. The media profile must match the mount configuration. Connecting to a mount that already has an active direct source returns `403 Forbidden`.
+
+Standard Icecast source headers (`ice-name`, `ice-genre`, `ice-description`, `ice-url`, `ice-bitrate`, `ice-public`, `ice-audio-info`, and `icy-*` equivalents) are read from the source request and used as stream metadata unless explicitly overridden in the mount configuration.
 
 ## Admin API
 
@@ -39,6 +43,18 @@ Admin endpoints require `Authorization: Bearer <KITE_ADMIN_TOKEN>`.
 | `GET` | `/api/v1/mounts` | Runtime mount status |
 | `DELETE` | `/api/v1/source?mount=/radio` | Disconnect active source |
 | `GET` | `/metrics` | Prometheus exposition |
+
+### Icecast-compatible XML Admin API
+
+Kite also serves Icecast 2.4-compatible XML endpoints under `/admin/`, authenticated with HTTP Basic Auth (password `<KITE_ADMIN_TOKEN>`, typically username `admin`) or `Authorization: Bearer <KITE_ADMIN_TOKEN>`:
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/admin/stats` | Global and per-mount XML statistics (`<icestats>`) |
+| `GET` | `/admin/listmounts` | Connected/configured mounts (`<icestats><source mount="...">`) |
+| `GET` | `/admin/listclients?mount=/radio` | Connected listeners for a mount (`<listener id="...">`) |
+| `GET`, `POST` | `/admin/killclient?mount=/radio&id=<id>` | Disconnect a specific listener by ID |
+| `GET`, `POST` | `/admin/killsource?mount=/radio` | Disconnect the active source on a mount |
 
 Use `If-Match` with the config `ETag` to avoid overwriting a newer revision. Listener addresses, admin bind settings, and TLS mode require a restart.
 

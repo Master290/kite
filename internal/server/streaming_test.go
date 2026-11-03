@@ -23,9 +23,11 @@ import (
 // Optional mutators adjust the config before the server is built.
 func publicServer(t *testing.T, mutators ...func(*config.Config)) (*Server, *httptest.Server) {
 	t.Helper()
+	t.Setenv("ADMIN_TOKEN", "admin")
 	t.Setenv("SOURCE_PASSWORD", "source")
 	source := config.SourceCredential{Username: "source", PasswordEnv: "SOURCE_PASSWORD"}
 	cfg := &config.Config{
+		Admin: config.Admin{Address: "127.0.0.1:9090", TokenEnv: "ADMIN_TOKEN"},
 		Defaults: config.Defaults{
 			SourceTimeout:    config.Duration(250 * time.Millisecond),
 			FailbackDelay:    config.Duration(250 * time.Millisecond),
@@ -408,7 +410,8 @@ func TestStatusJSONFiltersHiddenMounts(t *testing.T) {
 	}
 	var doc struct {
 		Icestats struct {
-			Source []struct {
+			Source struct {
+				ListenURL string `json:"listenurl"`
 				Path      string `json:"path"`
 				Listeners int    `json:"listeners"`
 			} `json:"source"`
@@ -417,11 +420,8 @@ func TestStatusJSONFiltersHiddenMounts(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
 		t.Fatal(err)
 	}
-	if len(doc.Icestats.Source) != 1 {
-		t.Fatalf("sources=%+v", doc.Icestats.Source)
-	}
-	if doc.Icestats.Source[0].Path != "/radio" {
-		t.Fatalf("path=%q", doc.Icestats.Source[0].Path)
+	if !strings.HasSuffix(doc.Icestats.Source.ListenURL, "/radio") {
+		t.Fatalf("listenurl=%q", doc.Icestats.Source.ListenURL)
 	}
 }
 

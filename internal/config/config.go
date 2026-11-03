@@ -85,6 +85,7 @@ type Defaults struct {
 	SourceTimeout        Duration `yaml:"source_timeout" json:"source_timeout"`
 	FailbackDelay        Duration `yaml:"failback_delay" json:"failback_delay"`
 	BufferDuration       Duration `yaml:"buffer_duration" json:"buffer_duration"`
+	BurstBytes           int      `yaml:"burst_bytes,omitempty" json:"burst_bytes,omitempty"`
 	WriteInterval        Duration `yaml:"write_interval" json:"write_interval"`
 	ListenerWriteTimeout Duration `yaml:"listener_write_timeout" json:"listener_write_timeout"`
 	RelayIdleTimeout     Duration `yaml:"relay_idle_timeout" json:"relay_idle_timeout"`
@@ -105,6 +106,7 @@ type Mount struct {
 	SourceTimeout        Duration         `yaml:"source_timeout,omitempty" json:"source_timeout,omitempty"`
 	FailbackDelay        Duration         `yaml:"failback_delay,omitempty" json:"failback_delay,omitempty"`
 	BufferDuration       Duration         `yaml:"buffer_duration,omitempty" json:"buffer_duration,omitempty"`
+	BurstBytes           int              `yaml:"burst_bytes,omitempty" json:"burst_bytes,omitempty"`
 	ListenerWriteTimeout Duration         `yaml:"listener_write_timeout,omitempty" json:"listener_write_timeout,omitempty"`
 	RelayIdleTimeout     Duration         `yaml:"relay_idle_timeout,omitempty" json:"relay_idle_timeout,omitempty"`
 	RelayMaxBackoff      Duration         `yaml:"relay_max_backoff,omitempty" json:"relay_max_backoff,omitempty"`
@@ -137,6 +139,28 @@ type Metadata struct {
 	URL         string `yaml:"url,omitempty" json:"url,omitempty"`
 	Bitrate     int    `yaml:"bitrate,omitempty" json:"bitrate,omitempty"`
 	Public      bool   `yaml:"public,omitempty" json:"public,omitempty"`
+	PublicSet   bool   `yaml:"-" json:"-"`
+}
+
+func (m *Metadata) UnmarshalYAML(node *yaml.Node) error {
+	type rawMetadata Metadata
+	var raw rawMetadata
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			switch node.Content[i].Value {
+			case "name", "description", "genre", "url", "bitrate":
+			case "public":
+				raw.PublicSet = true
+			default:
+				return fmt.Errorf("unknown metadata field %q", node.Content[i].Value)
+			}
+		}
+	}
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	*m = Metadata(raw)
+	return nil
 }
 
 type Fallback struct {
@@ -166,6 +190,7 @@ func Default() Config {
 			SourceTimeout:        Duration(3 * time.Second),
 			FailbackDelay:        Duration(5 * time.Second),
 			BufferDuration:       Duration(2 * time.Second),
+			BurstBytes:           65536,
 			WriteInterval:        Duration(100 * time.Millisecond),
 			ListenerWriteTimeout: Duration(10 * time.Second),
 			RelayIdleTimeout:     Duration(10 * time.Second),
@@ -242,6 +267,12 @@ func (c *Config) Normalize(baseDir string) error {
 	}
 	if c.Defaults.BufferDuration == 0 {
 		c.Defaults.BufferDuration = Duration(2 * time.Second)
+	}
+	if c.Defaults.BurstBytes == 0 {
+		c.Defaults.BurstBytes = 65536
+	}
+	if c.Defaults.BurstBytes < 0 {
+		return errors.New("burst_bytes must be non-negative")
 	}
 	if c.Defaults.WriteInterval == 0 {
 		c.Defaults.WriteInterval = Duration(100 * time.Millisecond)
@@ -416,6 +447,12 @@ func normalizeMount(m *Mount, d Defaults, baseDir string) error {
 	}
 	if m.BufferDuration == 0 {
 		m.BufferDuration = d.BufferDuration
+	}
+	if m.BurstBytes == 0 {
+		m.BurstBytes = d.BurstBytes
+	}
+	if m.BurstBytes < 0 {
+		return errors.New("burst_bytes must be non-negative")
 	}
 	if m.ListenerWriteTimeout == 0 {
 		m.ListenerWriteTimeout = d.ListenerWriteTimeout

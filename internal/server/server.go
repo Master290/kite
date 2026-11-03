@@ -32,11 +32,12 @@ import (
 var ErrRestartRequired = errors.New("restart required for this configuration change")
 
 type Server struct {
-	log     *slog.Logger
-	store   *ConfigStore
-	hub     *stream.Hub
-	metrics *Metrics
-	tls     *certificateProvider
+	log       *slog.Logger
+	store     *ConfigStore
+	hub       *stream.Hub
+	metrics   *Metrics
+	tls       *certificateProvider
+	startedAt time.Time
 
 	httpServer      *http.Server
 	httpsServer     *http.Server
@@ -73,7 +74,7 @@ func New(cfg *config.Config, configPath string, logger *slog.Logger) (*Server, e
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{log: logger, store: store, hub: hub, metrics: metrics, tls: tlsProvider}
+	s := &Server{log: logger, store: store, hub: hub, metrics: metrics, tls: tlsProvider, startedAt: time.Now()}
 	return s, nil
 }
 
@@ -235,6 +236,7 @@ func (s *Server) registerPublic(mux *http.ServeMux) {
 	mux.HandleFunc("/_kite/v1/playlist.m3u", s.handlePlaylist)
 	mux.HandleFunc("/status-json.xsl", s.handleStatus)
 	mux.HandleFunc("/admin/metadata", s.handleMetadata)
+	s.registerIcecastAdmin(mux)
 }
 
 func (s *Server) registerAdmin(mux *http.ServeMux) {
@@ -244,6 +246,7 @@ func (s *Server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/reload", s.adminAuth(s.handleReload))
 	mux.HandleFunc("/api/v1/mounts", s.adminAuth(s.handleMounts))
 	mux.HandleFunc("/api/v1/source", s.adminAuth(s.handleSourceAction))
+	s.registerIcecastAdmin(mux)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -281,6 +284,9 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 	if s.routeHLS(w, r, r.URL.Path) {
 		return
 	}
+	if s.routeMountPlaylist(w, r, r.URL.Path) {
+		return
+	}
 	m, ok := s.hub.Get(r.URL.Path)
 	if !ok {
 		if (r.URL.Path == "/" || r.URL.Path == "/index.html" || r.URL.Path == "/status.xsl") && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
@@ -298,15 +304,17 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	meta := m.StreamMetadata()
 	setCORS(w, m.Config().CORSOrigins, r.Header.Get("Origin"))
 	w.Header().Set("Content-Type", m.Config().ContentType)
 	w.Header().Set("Cache-Control", "no-cache, no-store")
-	w.Header().Set("icy-name", m.Config().Metadata.Name)
-	w.Header().Set("icy-description", m.Config().Metadata.Description)
-	w.Header().Set("icy-genre", m.Config().Metadata.Genre)
-	w.Header().Set("icy-url", m.Config().Metadata.URL)
-	w.Header().Set("icy-br", strconv.Itoa(m.Config().Metadata.Bitrate))
-	w.Header().Set("Access-Control-Expose-Headers", "icy-name, icy-description, icy-genre, icy-url, icy-br")
+	w.Header().Set("icy-name", meta.Name)
+	w.Header().Set("icy-description", meta.Description)
+	w.Header().Set("icy-genre", meta.Genre)
+	w.Header().Set("icy-url", meta.URL)
+	w.Header().Set("icy-br", strconv.Itoa(meta.Bitrate))
+	w.Header().Set("icy-pub", boolToZeroOne(meta.Public))
+	w.Header().Set("Access-Control-Expose-Headers", "icy-name, icy-description, icy-genre, icy-url, icy-br, icy-pub")
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -315,7 +323,7 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 		s.streamICY(w, r, m)
 		return
 	}
-	sub := m.SubscribeContext(r.Context(), listenerTransport(r))
+	sub := m.SubscribeContext(s.listenerContext(r), listenerTransport(r))
 	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration(), s.listenerWriteTimeout(m))
 	defer writer.Flush()
 	if err := writer.Flush(); err != nil {
@@ -330,6 +338,14 @@ func (s *Server) handleListener(w http.ResponseWriter, r *http.Request) {
 	_ = stream.Copy(r.Context(), writer, sub)
 }
 
+func (s *Server) listenerContext(r *http.Request) context.Context {
+	return stream.WithListenerClientInfo(r.Context(), requestClientIP(r), r.Header.Get("User-Agent"))
+}
+
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
+
 func (s *Server) handleSource(w http.ResponseWriter, r *http.Request, m *stream.Mount) {
 	if !s.checkSourceAuth(r, m.Config().Source) {
 		w.Header().Set("WWW-Authenticate", `Basic realm="kite"`)
@@ -337,21 +353,30 @@ func (s *Server) handleSource(w http.ResponseWriter, r *http.Request, m *stream.
 		return
 	}
 	if err := m.AcquireSource(); err != nil {
-		http.Error(w, "source already connected", http.StatusConflict)
+		http.Error(w, "source already connected", http.StatusForbidden)
 		return
 	}
 	defer m.ReleaseSource()
+	m.SetSourceStreamMetadata(parseSourceStreamMetadata(r))
 	s.log.Info("source connected", "mount", m.Config().Path, "method", r.Method, "proto", r.Proto, "content_length", r.ContentLength, "transfer_encoding", r.TransferEncoding, "expect", r.Header.Get("Expect"))
 	if r.ProtoMajor == 1 && r.ContentLength == 0 && len(r.TransferEncoding) == 0 {
 		s.handleRawSource(w, r, m)
 		return
 	}
-	m.SetSourceCloser(r.Body)
+	rc := http.NewResponseController(w)
+	var forceClosed atomic.Bool
+	m.SetSourceCloser(closerFunc(func() error {
+		forceClosed.Store(true)
+		if err := rc.SetReadDeadline(time.Now()); err != nil {
+			go func() { _ = r.Body.Close() }()
+		}
+		return nil
+	}))
 	if ct := r.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(ct, m.Config().ContentType) && m.Config().Profile != "opaque" {
 		s.log.Warn("source content type differs", "expected", m.Config().ContentType, "actual", ct)
 	}
 	err := stream.Pump(m.Config().Profile, r.Body, m.Write)
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+	if forceClosed.Load() || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		s.log.Info("source disconnected", "mount", m.Config().Path, "reason", err)
 		w.WriteHeader(http.StatusOK)
 		return
@@ -401,7 +426,7 @@ func (s *Server) handleRawSource(w http.ResponseWriter, r *http.Request, m *stre
 func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mount) {
 	metaInt := m.Config().ICYMetaInterval
 	w.Header().Set("icy-metaint", strconv.Itoa(metaInt))
-	sub := m.SubscribeContext(r.Context(), "http-icy")
+	sub := m.SubscribeContext(s.listenerContext(r), "http-icy")
 	defer sub.Close("client_closed")
 	writer := newIntervalWriter(w, s.Config().Defaults.WriteInterval.Duration(), s.listenerWriteTimeout(m))
 	defer writer.Flush()
@@ -455,6 +480,14 @@ func (s *Server) streamICY(w http.ResponseWriter, r *http.Request, m *stream.Mou
 					}
 					return
 				}
+				if err := writer.Flush(); err != nil {
+					if isDeadlineError(err) {
+						sub.Close("write_timeout")
+					}
+					return
+				}
+			}
+			if !sub.HasBuffered() {
 				if err := writer.Flush(); err != nil {
 					if isDeadlineError(err) {
 						sub.Close("write_timeout")
@@ -542,7 +575,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer c.CloseNow()
 	ctx, wsCancel := context.WithCancel(r.Context())
 	defer wsCancel()
-	sub := m.Subscribe("websocket")
+	sub := m.SubscribeContext(s.listenerContext(r), "websocket")
 	defer sub.Close("client_closed")
 	events, cancel := m.SubscribeEvents(0)
 	defer cancel()
@@ -644,27 +677,6 @@ func (s *Server) handleStatusPage(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(web.StatusHTML)
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	type statusItem struct {
-		stream.Status
-		ServerName        string `json:"server_name,omitempty"`
-		ServerDescription string `json:"server_description,omitempty"`
-		Genre             string `json:"genre,omitempty"`
-	}
-	items := make([]statusItem, 0)
-	for _, st := range s.hub.Status() {
-		if m, ok := s.Config().Mount(st.Path); ok && !m.Hidden && m.Metadata.Public {
-			items = append(items, statusItem{
-				Status:            st,
-				ServerName:        m.Metadata.Name,
-				ServerDescription: m.Metadata.Description,
-				Genre:             m.Metadata.Genre,
-			})
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"icestats": map[string]any{"source": items}})
-}
-
 func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 	mount := r.URL.Query().Get("mount")
 	if mount == "" {
@@ -675,14 +687,20 @@ func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.checkSourceAuth(r, m.Config().Source) {
+	if !s.checkSourceAuth(r, m.Config().Source) && !s.checkAdminBasicAuth(r, "") {
 		w.Header().Set("WWW-Authenticate", `Basic realm="kite"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	title := r.FormValue("song")
 	if title == "" {
-		title = r.FormValue("title")
+		artist := r.FormValue("artist")
+		track := r.FormValue("title")
+		if artist != "" && track != "" {
+			title = artist + " - " + track
+		} else {
+			title = track
+		}
 	}
 	m.SetMetadata(stream.Metadata{Title: title, URL: r.FormValue("url")})
 	writeJSON(w, 200, map[string]any{"ok": true, "metadata": m.Metadata()})
