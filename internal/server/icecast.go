@@ -37,6 +37,9 @@ const (
 	defaultAuthMaxEntries     = 100000
 	defaultAuthIPv6PrefixBits = 64
 
+	maxLazyScanSteps    = 16
+	maxExpireEvictBatch = 64
+
 	bucketIdle    = 0
 	bucketFailing = 1
 	bucketLocked  = 2
@@ -47,6 +50,7 @@ type authLimiter struct {
 	ips            map[string]*ipAuthState
 	heads          [3]*ipAuthState
 	tails          [3]*ipAuthState
+	lockHeap       []*ipAuthState
 	baseDelay      time.Duration
 	maxDelay       time.Duration
 	decayInterval  time.Duration
@@ -74,6 +78,7 @@ type ipAuthState struct {
 	bcryptWindow      time.Time
 	bcryptCount       int
 	bucket            int
+	heapIdx           int
 	inList            bool
 	prev              *ipAuthState
 	next              *ipAuthState
@@ -158,21 +163,124 @@ func (l *authLimiter) now() time.Time {
 }
 
 func (l *authLimiter) setIPv6PrefixBits(bits int) {
-	if bits < 1 || bits > 128 {
-		return
+	if bits <= 0 {
+		bits = defaultAuthIPv6PrefixBits
+	}
+	if bits > 128 {
+		bits = 128
 	}
 	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.ipv6PrefixBits == bits {
+		return
+	}
 	l.ipv6PrefixBits = bits
-	l.mu.Unlock()
+	l.clearLocked()
+}
+
+func (l *authLimiter) clearLocked() {
+	l.ips = make(map[string]*ipAuthState)
+	l.heads = [3]*ipAuthState{}
+	l.tails = [3]*ipAuthState{}
+	l.lockHeap = nil
 }
 
 func (l *authLimiter) key(ip string) string {
 	return normalizeIPKey(ip, l.ipv6PrefixBits)
 }
 
+func (l *authLimiter) heapLess(i, j int) bool {
+	ui := l.lockHeap[i].latestLockedUntil()
+	uj := l.lockHeap[j].latestLockedUntil()
+	if ui.Equal(uj) {
+		return l.lockHeap[i].lastSeen.Before(l.lockHeap[j].lastSeen)
+	}
+	return ui.Before(uj)
+}
+
+func (l *authLimiter) heapSwap(i, j int) {
+	l.lockHeap[i], l.lockHeap[j] = l.lockHeap[j], l.lockHeap[i]
+	l.lockHeap[i].heapIdx = i
+	l.lockHeap[j].heapIdx = j
+}
+
+func (l *authLimiter) heapUp(i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if !l.heapLess(i, parent) {
+			break
+		}
+		l.heapSwap(i, parent)
+		i = parent
+	}
+}
+
+func (l *authLimiter) heapDown(i int) {
+	n := len(l.lockHeap)
+	for {
+		left := 2*i + 1
+		if left >= n {
+			break
+		}
+		smallest := left
+		if right := left + 1; right < n && l.heapLess(right, left) {
+			smallest = right
+		}
+		if !l.heapLess(smallest, i) {
+			break
+		}
+		l.heapSwap(i, smallest)
+		i = smallest
+	}
+}
+
+func (l *authLimiter) heapPush(st *ipAuthState) {
+	if st.heapIdx >= 0 {
+		l.heapFix(st)
+		return
+	}
+	st.heapIdx = len(l.lockHeap)
+	l.lockHeap = append(l.lockHeap, st)
+	l.heapUp(st.heapIdx)
+}
+
+func (l *authLimiter) heapFix(st *ipAuthState) {
+	idx := st.heapIdx
+	if idx < 0 || idx >= len(l.lockHeap) {
+		return
+	}
+	l.heapUp(idx)
+	l.heapDown(st.heapIdx)
+}
+
+func (l *authLimiter) heapRemove(st *ipAuthState) {
+	idx := st.heapIdx
+	if idx < 0 || idx >= len(l.lockHeap) {
+		st.heapIdx = -1
+		return
+	}
+	last := len(l.lockHeap) - 1
+	if idx != last {
+		l.heapSwap(idx, last)
+		l.lockHeap[last] = nil
+		l.lockHeap = l.lockHeap[:last]
+		l.heapUp(idx)
+		if idx < len(l.lockHeap) {
+			l.heapDown(idx)
+		}
+	} else {
+		l.lockHeap[last] = nil
+		l.lockHeap = l.lockHeap[:last]
+	}
+	st.heapIdx = -1
+}
+
 func (l *authLimiter) removeNode(st *ipAuthState) {
 	if !st.inList {
 		return
+	}
+	if st.heapIdx >= 0 {
+		l.heapRemove(st)
 	}
 	b := st.bucket
 	if st.prev != nil {
@@ -202,12 +310,69 @@ func (l *authLimiter) pushFront(st *ipAuthState, b int) {
 		l.tails[b] = st
 	}
 	st.inList = true
+	if b == bucketLocked {
+		l.heapPush(st)
+	}
+}
+
+func (l *authLimiter) pushBack(st *ipAuthState, b int) {
+	st.bucket = b
+	st.next = nil
+	st.prev = l.tails[b]
+	if l.tails[b] != nil {
+		l.tails[b].next = st
+	}
+	l.tails[b] = st
+	if l.heads[b] == nil {
+		l.heads[b] = st
+	}
+	st.inList = true
+	if b == bucketLocked {
+		l.heapPush(st)
+	}
+}
+
+// insertByLastSeen inserts st into bucket b while preserving lastSeen order near the tail
+// with bounded O(1) work, avoiding placing stale reclassified entries at the head.
+func (l *authLimiter) insertByLastSeen(st *ipAuthState, b int) {
+	if l.tails[b] == nil || !st.lastSeen.After(l.tails[b].lastSeen) {
+		l.pushBack(st, b)
+		return
+	}
+	if !st.lastSeen.Before(l.heads[b].lastSeen) {
+		l.pushFront(st, b)
+		return
+	}
+	cur := l.tails[b]
+	for steps := 0; cur != nil && cur.lastSeen.Before(st.lastSeen) && steps < maxLazyScanSteps; steps++ {
+		cur = cur.prev
+	}
+	if cur == nil {
+		l.pushFront(st, b)
+		return
+	}
+	st.bucket = b
+	st.prev = cur
+	st.next = cur.next
+	if cur.next != nil {
+		cur.next.prev = st
+	} else {
+		l.tails[b] = st
+	}
+	cur.next = st
+	st.inList = true
+	if b == bucketLocked {
+		l.heapPush(st)
+	}
 }
 
 func (l *authLimiter) touch(st *ipAuthState, now time.Time) {
 	st.lastSeen = now
 	b := st.targetBucket(now)
 	if st.inList && st.bucket == b && l.heads[b] == st {
+		if b == bucketLocked {
+			l.heapFix(st)
+		}
 		return
 	}
 	l.removeNode(st)
@@ -245,6 +410,9 @@ func (l *authLimiter) decayLocked(st *ipAuthState, now time.Time) {
 	}
 	if st.totalFailures < globalLockoutThreshold {
 		st.globalLockedUntil = time.Time{}
+		if st.heapIdx >= 0 {
+			l.heapFix(st)
+		}
 	}
 	st.lastFailure = st.lastFailure.Add(time.Duration(steps) * period)
 }
@@ -264,16 +432,27 @@ func (l *authLimiter) isExpired(st *ipAuthState, now time.Time) bool {
 }
 
 func (l *authLimiter) evictExpiredLocked(now time.Time) {
-	ttl := l.ttl
-	if ttl <= 0 {
-		ttl = defaultAuthEntryTTL
+	for b := 0; b < len(l.tails); b++ {
+		cur := l.tails[b]
+		nonExpired := 0
+		evicted := 0
+		for cur != nil && nonExpired < maxLazyScanSteps && evicted < maxExpireEvictBatch {
+			prev := cur.prev
+			if l.isExpired(cur, now) {
+				l.evictNode(cur)
+				evicted++
+			} else {
+				nonExpired++
+			}
+			cur = prev
+		}
 	}
+}
+
+func (l *authLimiter) evictAllExpiredLocked(now time.Time) {
 	for b := 0; b < len(l.tails); b++ {
 		for cur := l.tails[b]; cur != nil; {
 			prev := cur.prev
-			if now.Sub(cur.lastSeen) <= ttl {
-				break
-			}
 			if l.isExpired(cur, now) {
 				l.evictNode(cur)
 			}
@@ -283,48 +462,68 @@ func (l *authLimiter) evictExpiredLocked(now time.Time) {
 }
 
 func (l *authLimiter) evictOneVictimLocked(now time.Time) {
-	// Refresh bucket classification of entries in bucketLocked or bucketFailing whose lockouts/failures decayed.
-	for cur := l.tails[bucketLocked]; cur != nil; {
+	// 1. Lazily reclassify expired lockouts from the top of the min-heap (soonest lockedUntil first).
+	for steps := 0; len(l.lockHeap) > 0 && steps < maxLazyScanSteps; steps++ {
+		top := l.lockHeap[0]
+		l.decayLocked(top, now)
+		if l.isExpired(top, now) {
+			l.evictNode(top)
+			return
+		}
+		if tb := top.targetBucket(now); tb != bucketLocked {
+			l.removeNode(top)
+			l.insertByLastSeen(top, tb)
+			continue
+		}
+		break
+	}
+	// Bounded tail check on bucketLocked in case decay cleared a global lockout earlier than lockedUntil.
+	for cur, steps := l.tails[bucketLocked], 0; cur != nil && steps < maxLazyScanSteps; steps++ {
 		prev := cur.prev
 		l.decayLocked(cur, now)
+		if l.isExpired(cur, now) {
+			l.evictNode(cur)
+			return
+		}
 		if tb := cur.targetBucket(now); tb != bucketLocked {
 			l.removeNode(cur)
-			l.pushFront(cur, tb)
+			l.insertByLastSeen(cur, tb)
 		}
 		cur = prev
 	}
-	for cur := l.tails[bucketFailing]; cur != nil; {
+	// 2. Lazily reclassify a bounded number of entries at the tail of bucketFailing whose failures decayed.
+	for cur, steps := l.tails[bucketFailing], 0; cur != nil && steps < maxLazyScanSteps; steps++ {
 		prev := cur.prev
 		l.decayLocked(cur, now)
+		if l.isExpired(cur, now) {
+			l.evictNode(cur)
+			return
+		}
 		if tb := cur.targetBucket(now); tb != bucketFailing {
 			l.removeNode(cur)
-			l.pushFront(cur, tb)
+			l.insertByLastSeen(cur, tb)
 		}
 		cur = prev
 	}
 
-	// 1. Prefer evicting entries with zero failures and no active lockout (bucketIdle, LRU first).
+	// 3. Evict by priority in O(1)/O(log n):
+	// (a) Zero failures and no active lockout (bucketIdle, LRU first).
 	if l.tails[bucketIdle] != nil {
 		l.evictNode(l.tails[bucketIdle])
 		return
 	}
-	// 2. Next, evict entries with no active lockout (bucketFailing, LRU first).
+	// (b) No active lockout (bucketFailing, LRU first).
 	if l.tails[bucketFailing] != nil {
 		l.evictNode(l.tails[bucketFailing])
 		return
 	}
-	// 3. Every entry is actively locked out: evict the one whose lockout expires soonest.
-	var soonest *ipAuthState
-	var soonestTime time.Time
-	for cur := l.tails[bucketLocked]; cur != nil; cur = cur.prev {
-		until := cur.latestLockedUntil()
-		if soonest == nil || until.Before(soonestTime) {
-			soonest = cur
-			soonestTime = until
-		}
+	// (c) Every entry is actively locked out: evict the one whose lockout expires soonest via min-heap.
+	if len(l.lockHeap) > 0 {
+		l.evictNode(l.lockHeap[0])
+		return
 	}
-	if soonest != nil {
-		l.evictNode(soonest)
+	if l.tails[bucketLocked] != nil {
+		l.evictNode(l.tails[bucketLocked])
 	}
 }
 
@@ -345,7 +544,7 @@ func (l *authLimiter) state(key string, now time.Time) *ipAuthState {
 	for len(l.ips) >= maxEntries && len(l.ips) > 0 {
 		l.evictOneVictimLocked(now)
 	}
-	st = &ipAuthState{ip: key, lastSeen: now}
+	st = &ipAuthState{ip: key, lastSeen: now, heapIdx: -1}
 	l.ips[key] = st
 	l.pushFront(st, bucketIdle)
 	return st
@@ -486,20 +685,21 @@ func (l *authLimiter) recordSuccess(ip, scope string) {
 func (l *authLimiter) len() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.evictExpiredLocked(l.now())
+	l.evictAllExpiredLocked(l.now())
 	return len(l.ips)
 }
 
 func (s *Server) getAuthLimiter() *authLimiter {
 	s.authMu.Lock()
 	if s.auth == nil {
-		s.auth = newAuthLimiter()
+		lim := newAuthLimiter()
+		if cfg := s.Config(); cfg != nil {
+			lim.setIPv6PrefixBits(cfg.Server.IPv6PrefixBits)
+		}
+		s.auth = lim
 	}
 	lim := s.auth
 	s.authMu.Unlock()
-	if cfg := s.Config(); cfg != nil && cfg.Server.IPv6PrefixBits > 0 {
-		lim.setIPv6PrefixBits(cfg.Server.IPv6PrefixBits)
-	}
 	return lim
 }
 

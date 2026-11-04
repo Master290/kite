@@ -1518,3 +1518,184 @@ func newTestRecorder() *testRecorder {
 func (r *testRecorder) Header() http.Header         { return r.header }
 func (r *testRecorder) WriteHeader(code int)        { r.Code = code }
 func (r *testRecorder) Write(p []byte) (int, error) { return r.Body.Write(p) }
+
+func formatBenchIP(i int) string {
+	return itoa((i>>16)&0xff+1) + "." + itoa((i>>8)&0xff) + "." + itoa(i&0xff) + "." + itoa((i>>24)&0xff+1)
+}
+
+func TestAuthLimiterAtCapacityFlatInsertCostAndReloadPrefix(t *testing.T) {
+	// 1. Verify O(1)/O(log n) eviction at the 100k cap keeps per-insert cost flat.
+	const cap100k = 100000
+	const batch = 2000
+	totalIPs := cap100k + batch*2
+	ips := make([]string, totalIPs)
+	for i := 0; i < totalIPs; i++ {
+		ips[i] = formatBenchIP(i)
+	}
+
+	lim := newAuthLimiter()
+	lim.maxEntries = cap100k
+	now := time.Now()
+	lim.nowFn = func() time.Time { return now }
+
+	// Lock out 5,000 IPs so lockHeap and bucketLocked are non-trivial, and fill to 50,000 (below capacity).
+	for i := 0; i < 5000; i++ {
+		for f := 0; f < authLockoutThreshold; f++ {
+			lim.recordFailure(ips[i], "icecast_admin")
+		}
+	}
+	for i := 5000; i < 50000; i++ {
+		lim.recordFailure(ips[i], "source")
+	}
+
+	startBelow := time.Now()
+	for i := 50000; i < 50000+batch; i++ {
+		lim.recordFailure(ips[i], "source")
+	}
+	belowCapPerInsert := time.Since(startBelow) / batch
+
+	// Fill remaining slots up to 100k capacity.
+	for i := 50000 + batch; i < cap100k; i++ {
+		lim.recordFailure(ips[i], "source")
+	}
+	if len(lim.ips) != cap100k {
+		t.Fatalf("len(lim.ips)=%d, want %d", len(lim.ips), cap100k)
+	}
+
+	// Measure per-insert cost at the 100k cap.
+	startAtCap := time.Now()
+	for i := cap100k; i < cap100k+batch; i++ {
+		lim.recordFailure(ips[i], "source")
+	}
+	atCapPerInsert := time.Since(startAtCap) / batch
+
+	// Measure per-insert cost at the 100k cap after lockouts expire (lazy reclassification via min-heap).
+	now = now.Add(2 * time.Second)
+	startReclass := time.Now()
+	for i := cap100k + batch; i < cap100k+batch*2; i++ {
+		lim.recordFailure(ips[i], "source")
+	}
+	reclassPerInsert := time.Since(startReclass) / batch
+
+	// Previously at the 100k cap each insert took ~2.9 ms (36x slower than below cap).
+	// Assert per-insert cost at 100k cap stays well under 50 µs and within a small multiple of below-cap cost.
+	if atCapPerInsert > 50*time.Microsecond {
+		t.Fatalf("per-insert cost at 100k cap too high: %v (below cap: %v)", atCapPerInsert, belowCapPerInsert)
+	}
+	if reclassPerInsert > 50*time.Microsecond {
+		t.Fatalf("per-insert cost during lazy reclassification at 100k cap too high: %v (below cap: %v)", reclassPerInsert, belowCapPerInsert)
+	}
+	maxAllowedRatio := belowCapPerInsert * 5
+	if maxAllowedRatio < 15*time.Microsecond {
+		maxAllowedRatio = 15 * time.Microsecond
+	}
+	if atCapPerInsert > maxAllowedRatio {
+		t.Fatalf("per-insert cost at 100k cap (%v) is not flat relative to below-cap (%v)", atCapPerInsert, belowCapPerInsert)
+	}
+
+	// 2. Verify bucket moves preserve lastSeen order (insertByLastSeen) so evictExpiredLocked
+	// does not stop early on a recently-seen entry when older entries behind it have expired.
+	orderLim := newAuthLimiter()
+	orderLim.maxEntries = 4
+	orderLim.ttl = 30 * time.Minute
+	t0 := time.Now()
+	orderNow := t0
+	orderLim.nowFn = func() time.Time { return orderNow }
+
+	// Insert idle IP1 at t0, idle IP2 at t0+25m, and locked IP3 at t0+1m (1s lockout).
+	orderLim.recordFailure("198.51.100.10", "source")
+	orderLim.recordSuccess("198.51.100.10", "source") // bucketIdle, lastSeen = t0
+
+	orderNow = t0.Add(1 * time.Minute)
+	for f := 0; f < authLockoutThreshold; f++ {
+		orderLim.recordFailure("198.51.100.11", "icecast_admin") // bucketLocked, lastSeen = t0+1m
+	}
+
+	orderNow = t0.Add(25 * time.Minute)
+	orderLim.recordFailure("198.51.100.12", "source")
+	orderLim.recordSuccess("198.51.100.12", "source") // bucketIdle, lastSeen = t0+25m
+	orderLim.recordFailure("198.51.100.13", "source") // bucketFailing, lastSeen = t0+25m
+
+	// At t0+26m, IP3's 1s lockout has long expired and its failures decayed, but its lastSeen is still t0+1m.
+	// Trigger eviction at capacity=4 by inserting IP4: IP3 is lazily reclassified and IP1 (oldest idle, t0) is evicted.
+	orderNow = t0.Add(26 * time.Minute)
+	orderLim.recordFailure("198.51.100.14", "source")
+
+	// Advance to t0+32m: IP3 (lastSeen=t0+1m, age=31m > 30m TTL) is expired, while IP2 (lastSeen=t0+25m, age=7m) is not.
+	// A single checkLocked call runs evictExpiredLocked and must evict expired IP3 without stopping early on IP2.
+	orderNow = t0.Add(32 * time.Minute)
+	orderLim.checkLocked("198.51.100.12", "source")
+	if _, exists := orderLim.ips["198.51.100.11"]; exists {
+		t.Fatal("expected expired reclassified entry 198.51.100.11 (lastSeen=t0+1m) to be evicted by evictExpiredLocked")
+	}
+
+	// 3. Verify IPv6 prefix is set on construction and reload, and changing the prefix on reload clears stale entries.
+	s, _ := publicServer(t, func(cfg *config.Config) {
+		cfg.Server.IPv6PrefixBits = 64
+	})
+	limSrv := s.getAuthLimiter()
+	if limSrv.ipv6PrefixBits != 64 {
+		t.Fatalf("initial ipv6PrefixBits=%d, want 64", limSrv.ipv6PrefixBits)
+	}
+	for f := 0; f < authLockoutThreshold; f++ {
+		limSrv.recordFailure("2001:db8:1111:2222::1", "icecast_admin")
+	}
+	if locked, _, _ := limSrv.checkLocked("2001:db8:1111:2222::99", "icecast_admin"); !locked {
+		t.Fatal("expected /64 peer to be locked")
+	}
+
+	// Reload with unchanged prefix (0 -> default 64): limiter state must be preserved.
+	unchangedCfg := *s.Config()
+	unchangedCfg.Server.IPv6PrefixBits = 0
+	s.applyConfig(&unchangedCfg)
+	if locked, _, _ := limSrv.checkLocked("2001:db8:1111:2222::99", "icecast_admin"); !locked {
+		t.Fatal("expected /64 lockout to remain when reload keeps effective prefix at 64")
+	}
+
+	// Reload with changed prefix (48): limiter must update prefix and clear old /64 entries.
+	changedCfg := *s.Config()
+	changedCfg.Server.IPv6PrefixBits = 48
+	s.applyConfig(&changedCfg)
+	if limSrv.ipv6PrefixBits != 48 {
+		t.Fatalf("reloaded ipv6PrefixBits=%d, want 48", limSrv.ipv6PrefixBits)
+	}
+	if locked, _, _ := limSrv.checkLocked("2001:db8:1111:2222::99", "icecast_admin"); locked {
+		t.Fatal("expected limiter state to be cleared when ipv6_prefix_bits changes on reload")
+	}
+	// Under /48, failures across different /64s in the same /48 now share state.
+	for f := 0; f < authLockoutThreshold; f++ {
+		limSrv.recordFailure("2001:db8:1111:"+itoa(f)+"::1", "icecast_admin")
+	}
+	if locked, _, _ := limSrv.checkLocked("2001:db8:1111:ffff::1", "icecast_admin"); !locked {
+		t.Fatal("expected /48 prefix grouping after reload")
+	}
+}
+
+func BenchmarkAuthLimiterAtCapacity(b *testing.B) {
+	const cap100k = 100000
+	lim := newAuthLimiter()
+	lim.maxEntries = cap100k
+	now := time.Now()
+	lim.nowFn = func() time.Time { return now }
+
+	// Pre-populate to the 100k cap with a mix of locked and failing entries.
+	for i := 0; i < 10000; i++ {
+		ip := formatBenchIP(i)
+		for f := 0; f < authLockoutThreshold; f++ {
+			lim.recordFailure(ip, "icecast_admin")
+		}
+	}
+	for i := 10000; i < cap100k; i++ {
+		lim.recordFailure(formatBenchIP(i), "source")
+	}
+
+	benchIPs := make([]string, 65536)
+	for i := range benchIPs {
+		benchIPs[i] = formatBenchIP(cap100k + i + 1)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		lim.recordFailure(benchIPs[i&65535], "source")
+	}
+}

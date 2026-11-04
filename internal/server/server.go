@@ -75,7 +75,9 @@ func New(cfg *config.Config, configPath string, logger *slog.Logger) (*Server, e
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{log: logger, store: store, hub: hub, metrics: metrics, tls: tlsProvider, startedAt: time.Now(), auth: newAuthLimiter()}
+	auth := newAuthLimiter()
+	auth.setIPv6PrefixBits(cfg.Server.IPv6PrefixBits)
+	s := &Server{log: logger, store: store, hub: hub, metrics: metrics, tls: tlsProvider, startedAt: time.Now(), auth: auth}
 	return s, nil
 }
 
@@ -860,7 +862,12 @@ func (s *Server) handleSourceAction(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
-func (s *Server) applyConfig(next *config.Config) { _ = s.hub.Apply(next) }
+func (s *Server) applyConfig(next *config.Config) {
+	_ = s.hub.Apply(next)
+	if next != nil {
+		s.getAuthLimiter().setIPv6PrefixBits(next.Server.IPv6PrefixBits)
+	}
+}
 
 func validateFallbackFiles(cfg *config.Config) error {
 	for _, mount := range cfg.Mounts {
