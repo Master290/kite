@@ -30,20 +30,30 @@ const (
 	globalLockoutThreshold = 15
 	defaultAuthBaseDelay   = 1 * time.Second
 	maxAuthLockoutDelay    = 15 * time.Minute
-	defaultAuthEntryTTL    = 30 * time.Minute
-	defaultAuthMaxEntries  = 100000
+	defaultAuthDecayPeriod = 15 * time.Minute
+	// defaultAuthEntryTTL is maxAuthLockoutDelay + defaultAuthDecayPeriod (15m + 15m = 30m)
+	// so entries survive the maximum lockout window plus one post-lockout decay window.
+	defaultAuthEntryTTL       = maxAuthLockoutDelay + defaultAuthDecayPeriod
+	defaultAuthMaxEntries     = 100000
+	defaultAuthIPv6PrefixBits = 64
+
+	bucketIdle    = 0
+	bucketFailing = 1
+	bucketLocked  = 2
 )
 
 type authLimiter struct {
-	mu         sync.Mutex
-	ips        map[string]*ipAuthState
-	lruHead    *ipAuthState
-	lruTail    *ipAuthState
-	baseDelay  time.Duration
-	maxDelay   time.Duration
-	ttl        time.Duration
-	maxEntries int
-	nowFn      func() time.Time
+	mu             sync.Mutex
+	ips            map[string]*ipAuthState
+	heads          [3]*ipAuthState
+	tails          [3]*ipAuthState
+	baseDelay      time.Duration
+	maxDelay       time.Duration
+	decayInterval  time.Duration
+	ttl            time.Duration
+	maxEntries     int
+	ipv6PrefixBits int
+	nowFn          func() time.Time
 }
 
 type scopeAuthState struct {
@@ -58,10 +68,13 @@ type ipAuthState struct {
 	adminAPI          scopeAuthState
 	totalFailures     int
 	globalLockedUntil time.Time
+	lastFailure       time.Time
 	lastLockout       time.Duration
 	lastSeen          time.Time
 	bcryptWindow      time.Time
 	bcryptCount       int
+	bucket            int
+	inList            bool
 	prev              *ipAuthState
 	next              *ipAuthState
 }
@@ -87,14 +100,53 @@ func (st *ipAuthState) latestLockedUntil() time.Time {
 	return latest
 }
 
+func (st *ipAuthState) activeScopeFailures() int {
+	return st.icecastAdmin.failures + st.source.failures + st.adminAPI.failures
+}
+
+func (st *ipAuthState) targetBucket(now time.Time) int {
+	if now.Before(st.latestLockedUntil()) {
+		return bucketLocked
+	}
+	if st.activeScopeFailures() > 0 || st.totalFailures > 0 {
+		return bucketFailing
+	}
+	return bucketIdle
+}
+
+func normalizeIPKey(ipStr string, ipv6PrefixBits int) string {
+	ip := net.ParseIP(strings.TrimSpace(ipStr))
+	if ip == nil {
+		return ipStr
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4.String()
+	}
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return ipStr
+	}
+	bits := ipv6PrefixBits
+	if bits <= 0 {
+		bits = defaultAuthIPv6PrefixBits
+	}
+	if bits >= 128 {
+		return ip16.String()
+	}
+	masked := ip16.Mask(net.CIDRMask(bits, 128))
+	return fmt.Sprintf("%s/%d", masked.String(), bits)
+}
+
 func newAuthLimiter() *authLimiter {
 	return &authLimiter{
-		ips:        make(map[string]*ipAuthState),
-		baseDelay:  defaultAuthBaseDelay,
-		maxDelay:   maxAuthLockoutDelay,
-		ttl:        defaultAuthEntryTTL,
-		maxEntries: defaultAuthMaxEntries,
-		nowFn:      time.Now,
+		ips:            make(map[string]*ipAuthState),
+		baseDelay:      defaultAuthBaseDelay,
+		maxDelay:       maxAuthLockoutDelay,
+		decayInterval:  defaultAuthDecayPeriod,
+		ttl:            defaultAuthEntryTTL,
+		maxEntries:     defaultAuthMaxEntries,
+		ipv6PrefixBits: defaultAuthIPv6PrefixBits,
+		nowFn:          time.Now,
 	}
 }
 
@@ -105,44 +157,96 @@ func (l *authLimiter) now() time.Time {
 	return time.Now()
 }
 
+func (l *authLimiter) setIPv6PrefixBits(bits int) {
+	if bits < 1 || bits > 128 {
+		return
+	}
+	l.mu.Lock()
+	l.ipv6PrefixBits = bits
+	l.mu.Unlock()
+}
+
+func (l *authLimiter) key(ip string) string {
+	return normalizeIPKey(ip, l.ipv6PrefixBits)
+}
+
 func (l *authLimiter) removeNode(st *ipAuthState) {
+	if !st.inList {
+		return
+	}
+	b := st.bucket
 	if st.prev != nil {
 		st.prev.next = st.next
-	} else if l.lruHead == st {
-		l.lruHead = st.next
+	} else if l.heads[b] == st {
+		l.heads[b] = st.next
 	}
 	if st.next != nil {
 		st.next.prev = st.prev
-	} else if l.lruTail == st {
-		l.lruTail = st.prev
+	} else if l.tails[b] == st {
+		l.tails[b] = st.prev
 	}
 	st.prev = nil
 	st.next = nil
+	st.inList = false
 }
 
-func (l *authLimiter) pushFront(st *ipAuthState) {
+func (l *authLimiter) pushFront(st *ipAuthState, b int) {
+	st.bucket = b
 	st.prev = nil
-	st.next = l.lruHead
-	if l.lruHead != nil {
-		l.lruHead.prev = st
+	st.next = l.heads[b]
+	if l.heads[b] != nil {
+		l.heads[b].prev = st
 	}
-	l.lruHead = st
-	if l.lruTail == nil {
-		l.lruTail = st
+	l.heads[b] = st
+	if l.tails[b] == nil {
+		l.tails[b] = st
 	}
+	st.inList = true
 }
 
 func (l *authLimiter) touch(st *ipAuthState, now time.Time) {
 	st.lastSeen = now
-	if l.lruHead != st {
-		l.removeNode(st)
-		l.pushFront(st)
+	b := st.targetBucket(now)
+	if st.inList && st.bucket == b && l.heads[b] == st {
+		return
 	}
+	l.removeNode(st)
+	l.pushFront(st, b)
 }
 
 func (l *authLimiter) evictNode(st *ipAuthState) {
 	l.removeNode(st)
 	delete(l.ips, st.ip)
+}
+
+func (l *authLimiter) decayLocked(st *ipAuthState, now time.Time) {
+	if st.lastFailure.IsZero() {
+		return
+	}
+	period := l.decayInterval
+	if period <= 0 {
+		period = defaultAuthDecayPeriod
+	}
+	elapsed := now.Sub(st.lastFailure)
+	if elapsed < period {
+		return
+	}
+	steps := int(elapsed / period)
+	if steps >= 30 {
+		st.totalFailures = 0
+		st.icecastAdmin.failures = 0
+		st.source.failures = 0
+		st.adminAPI.failures = 0
+	} else {
+		st.totalFailures >>= steps
+		st.icecastAdmin.failures >>= steps
+		st.source.failures >>= steps
+		st.adminAPI.failures >>= steps
+	}
+	if st.totalFailures < globalLockoutThreshold {
+		st.globalLockedUntil = time.Time{}
+	}
+	st.lastFailure = st.lastFailure.Add(time.Duration(steps) * period)
 }
 
 func (l *authLimiter) isExpired(st *ipAuthState, now time.Time) bool {
@@ -164,24 +268,73 @@ func (l *authLimiter) evictExpiredLocked(now time.Time) {
 	if ttl <= 0 {
 		ttl = defaultAuthEntryTTL
 	}
-	for cur := l.lruTail; cur != nil; {
-		prev := cur.prev
-		if now.Sub(cur.lastSeen) <= ttl {
-			break
+	for b := 0; b < len(l.tails); b++ {
+		for cur := l.tails[b]; cur != nil; {
+			prev := cur.prev
+			if now.Sub(cur.lastSeen) <= ttl {
+				break
+			}
+			if l.isExpired(cur, now) {
+				l.evictNode(cur)
+			}
+			cur = prev
 		}
-		if l.isExpired(cur, now) {
-			l.evictNode(cur)
-		}
-		cur = prev
 	}
 }
 
-func (l *authLimiter) state(ip string, now time.Time) *ipAuthState {
+func (l *authLimiter) evictOneVictimLocked(now time.Time) {
+	// Refresh bucket classification of entries in bucketLocked or bucketFailing whose lockouts/failures decayed.
+	for cur := l.tails[bucketLocked]; cur != nil; {
+		prev := cur.prev
+		l.decayLocked(cur, now)
+		if tb := cur.targetBucket(now); tb != bucketLocked {
+			l.removeNode(cur)
+			l.pushFront(cur, tb)
+		}
+		cur = prev
+	}
+	for cur := l.tails[bucketFailing]; cur != nil; {
+		prev := cur.prev
+		l.decayLocked(cur, now)
+		if tb := cur.targetBucket(now); tb != bucketFailing {
+			l.removeNode(cur)
+			l.pushFront(cur, tb)
+		}
+		cur = prev
+	}
+
+	// 1. Prefer evicting entries with zero failures and no active lockout (bucketIdle, LRU first).
+	if l.tails[bucketIdle] != nil {
+		l.evictNode(l.tails[bucketIdle])
+		return
+	}
+	// 2. Next, evict entries with no active lockout (bucketFailing, LRU first).
+	if l.tails[bucketFailing] != nil {
+		l.evictNode(l.tails[bucketFailing])
+		return
+	}
+	// 3. Every entry is actively locked out: evict the one whose lockout expires soonest.
+	var soonest *ipAuthState
+	var soonestTime time.Time
+	for cur := l.tails[bucketLocked]; cur != nil; cur = cur.prev {
+		until := cur.latestLockedUntil()
+		if soonest == nil || until.Before(soonestTime) {
+			soonest = cur
+			soonestTime = until
+		}
+	}
+	if soonest != nil {
+		l.evictNode(soonest)
+	}
+}
+
+func (l *authLimiter) state(key string, now time.Time) *ipAuthState {
 	if l.ips == nil {
 		l.ips = make(map[string]*ipAuthState)
 	}
-	st, ok := l.ips[ip]
+	st, ok := l.ips[key]
 	if ok {
+		l.decayLocked(st, now)
 		l.touch(st, now)
 		return st
 	}
@@ -189,12 +342,12 @@ func (l *authLimiter) state(ip string, now time.Time) *ipAuthState {
 	if maxEntries <= 0 {
 		maxEntries = defaultAuthMaxEntries
 	}
-	for len(l.ips) >= maxEntries && l.lruTail != nil {
-		l.evictNode(l.lruTail)
+	for len(l.ips) >= maxEntries && len(l.ips) > 0 {
+		l.evictOneVictimLocked(now)
 	}
-	st = &ipAuthState{ip: ip, lastSeen: now}
-	l.ips[ip] = st
-	l.pushFront(st)
+	st = &ipAuthState{ip: key, lastSeen: now}
+	l.ips[key] = st
+	l.pushFront(st, bucketIdle)
 	return st
 }
 
@@ -226,10 +379,12 @@ func (l *authLimiter) checkLocked(ip, scope string) (bool, time.Duration, int) {
 	defer l.mu.Unlock()
 	now := l.now()
 	l.evictExpiredLocked(now)
-	st, ok := l.ips[ip]
+	key := l.key(ip)
+	st, ok := l.ips[key]
 	if !ok {
 		return false, 0, 0
 	}
+	l.decayLocked(st, now)
 	sc := st.scopeState(scope)
 	var lockedUntil time.Time
 	failures := sc.failures
@@ -242,8 +397,8 @@ func (l *authLimiter) checkLocked(ip, scope string) (bool, time.Duration, int) {
 			failures = st.totalFailures
 		}
 	}
+	l.touch(st, now)
 	if !lockedUntil.IsZero() {
-		l.touch(st, now)
 		return true, lockedUntil.Sub(now), failures
 	}
 	return false, 0, failures
@@ -256,7 +411,8 @@ func (l *authLimiter) allowBcrypt(ip string) bool {
 	defer l.mu.Unlock()
 	now := l.now()
 	l.evictExpiredLocked(now)
-	st := l.state(ip, now)
+	key := l.key(ip)
+	st := l.state(key, now)
 	if now.Before(st.latestLockedUntil()) {
 		return false
 	}
@@ -276,10 +432,12 @@ func (l *authLimiter) recordFailure(ip, scope string) (int, time.Duration) {
 	defer l.mu.Unlock()
 	now := l.now()
 	l.evictExpiredLocked(now)
-	st := l.state(ip, now)
+	key := l.key(ip)
+	st := l.state(key, now)
 	sc := st.scopeState(scope)
 	sc.failures++
 	st.totalFailures++
+	st.lastFailure = now
 
 	var scopeDelay time.Duration
 	if sc.failures >= authLockoutThreshold {
@@ -300,6 +458,7 @@ func (l *authLimiter) recordFailure(ip, scope string) (int, time.Duration) {
 	if delay > st.lastLockout {
 		st.lastLockout = delay
 	}
+	l.touch(st, now)
 	return sc.failures, delay
 }
 
@@ -308,16 +467,18 @@ func (l *authLimiter) recordSuccess(ip, scope string) {
 	defer l.mu.Unlock()
 	now := l.now()
 	l.evictExpiredLocked(now)
-	st, ok := l.ips[ip]
+	key := l.key(ip)
+	st, ok := l.ips[key]
 	if !ok {
 		return
 	}
+	l.decayLocked(st, now)
 	sc := st.scopeState(scope)
 	sc.failures = 0
 	sc.lockedUntil = time.Time{}
-	if st.icecastAdmin.failures == 0 && st.source.failures == 0 && st.adminAPI.failures == 0 && st.totalFailures == 0 {
-		l.evictNode(st)
-		return
+	st.totalFailures = st.activeScopeFailures()
+	if st.totalFailures < globalLockoutThreshold {
+		st.globalLockedUntil = time.Time{}
 	}
 	l.touch(st, now)
 }
@@ -331,11 +492,15 @@ func (l *authLimiter) len() int {
 
 func (s *Server) getAuthLimiter() *authLimiter {
 	s.authMu.Lock()
-	defer s.authMu.Unlock()
 	if s.auth == nil {
 		s.auth = newAuthLimiter()
 	}
-	return s.auth
+	lim := s.auth
+	s.authMu.Unlock()
+	if cfg := s.Config(); cfg != nil && cfg.Server.IPv6PrefixBits > 0 {
+		lim.setIPv6PrefixBits(cfg.Server.IPv6PrefixBits)
+	}
+	return lim
 }
 
 func writeAuthLockout(w http.ResponseWriter, retryAfter time.Duration) {

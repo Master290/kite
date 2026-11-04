@@ -944,6 +944,14 @@ func (s *Server) altSvc(next http.Handler) http.Handler {
 	})
 }
 
+func parseBearerToken(header string) (string, bool) {
+	const prefix = "bearer "
+	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return "", false
+	}
+	return header[len(prefix):], true
+}
+
 func (s *Server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := s.adminToken()
@@ -963,7 +971,7 @@ func (s *Server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		got, hasBearer := strings.CutPrefix(rawAuth, "Bearer ")
+		got, hasBearer := parseBearerToken(rawAuth)
 		if !hasBearer || subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
 			failures, lockDelay := limiter.recordFailure(ip, "admin_api")
 			s.log.Warn("authentication failed", "scope", "admin_api", "ip", ip, "token", "[REDACTED]", "failures", failures, "lockout", lockDelay.Round(time.Millisecond).String(), "retry_after", lockDelay.Round(time.Millisecond).String())

@@ -1107,7 +1107,7 @@ func TestAuthLimiterXFFRightToLeftAndPerScopeAndEviction(t *testing.T) {
 		t.Fatalf("expected 429 on 6th admin attempt after interleaved source success, got %d", respAdmin6.StatusCode)
 	}
 
-	// 4. Admin API requires "Bearer " prefix (rejects raw token without prefix).
+	// 4. Admin API requires "Bearer " prefix (rejects raw token without prefix), and accepts case-insensitive "bearer "/"BEARER " per RFC 7235.
 	adminMux := http.NewServeMux()
 	s.registerAdmin(adminMux)
 	rawTokenReq := newTestRequest(http.MethodGet, "http://admin/api/v1/mounts", nil)
@@ -1117,32 +1117,171 @@ func TestAuthLimiterXFFRightToLeftAndPerScopeAndEviction(t *testing.T) {
 	if rawTokenRec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 when Bearer prefix is missing on /api/v1/mounts, got %d", rawTokenRec.Code)
 	}
+	for _, scheme := range []string{"bearer admin", "BEARER admin", "Bearer admin"} {
+		caseReq := newTestRequest(http.MethodGet, "http://admin/api/v1/mounts", nil)
+		caseReq.Header.Set("Authorization", scheme)
+		caseRec := newTestRecorder()
+		adminMux.ServeHTTP(caseRec, caseReq)
+		if caseRec.Code != http.StatusOK {
+			t.Fatalf("Authorization %q status=%d, want 200", scheme, caseRec.Code)
+		}
+	}
 
-	// 5. Eviction: TTL expiration and LRU hard cap.
+	// 5. Eviction preference:
+	// - Evict zero-failure unlocked entries first.
+	// - Next evict unlocked failing entries (never evicting a locked-out IP during an unlocked IP flood).
+	// - When every entry is locked out, evict the one whose lockout expires soonest.
 	lim := newAuthLimiter()
 	lim.ttl = 30 * time.Minute
-	lim.maxEntries = 10
+	lim.maxEntries = 5
 	now := time.Now()
 	lim.nowFn = func() time.Time { return now }
 
-	for i := 1; i <= 15; i++ {
+	// Lock out 198.51.100.1 (5 failures -> locked out).
+	for i := 0; i < 5; i++ {
+		lim.recordFailure("198.51.100.1", "icecast_admin")
+	}
+	if locked, _, _ := lim.checkLocked("198.51.100.1", "icecast_admin"); !locked {
+		t.Fatal("expected 198.51.100.1 to be locked out")
+	}
+
+	// Add 1 zero-failure entry (198.51.100.2 failed once then succeeded) and 3 single-failure unlocked entries.
+	lim.recordFailure("198.51.100.2", "source")
+	lim.recordSuccess("198.51.100.2", "source") // now 0 failures, unlocked (bucketIdle)
+	lim.recordFailure("198.51.100.3", "source")
+	lim.recordFailure("198.51.100.4", "source")
+	lim.recordFailure("198.51.100.5", "source")
+	if got := lim.len(); got != 5 {
+		t.Fatalf("limiter len=%d, want 5", got)
+	}
+
+	// Inserting a 6th IP must evict the zero-failure unlocked entry (198.51.100.2) first, even though 198.51.100.1 was inserted earlier.
+	lim.recordFailure("198.51.100.6", "source")
+	if _, exists := lim.ips["198.51.100.2"]; exists {
+		t.Fatal("expected zero-failure entry 198.51.100.2 to be evicted first")
+	}
+	if locked, _, _ := lim.checkLocked("198.51.100.1", "icecast_admin"); !locked {
+		t.Fatal("expected locked-out 198.51.100.1 to survive eviction")
+	}
+
+	// Flooding 50 more single-failure IPs past maxEntries=5 must only evict unlocked failing entries,
+	// keeping locked-out 198.51.100.1 locked out!
+	for i := 10; i < 60; i++ {
 		lim.recordFailure("192.0.2."+itoa(i), "source")
 	}
-	if got := lim.len(); got != 10 {
-		t.Fatalf("expected LRU cap to bound limiter at 10 entries, got %d", got)
+	if got := lim.len(); got != 5 {
+		t.Fatalf("expected cap of 5 entries after flood, got %d", got)
 	}
-	// First 5 entries (192.0.2.1..5) should have been evicted by LRU; 192.0.2.6..15 remain.
-	if _, _, failures := lim.checkLocked("192.0.2.1", "source"); failures != 0 {
-		t.Fatalf("expected 192.0.2.1 to be LRU-evicted, got failures=%d", failures)
+	if locked, _, _ := lim.checkLocked("198.51.100.1", "icecast_admin"); !locked {
+		t.Fatal("locked-out IP 198.51.100.1 was evicted by single-failure IP flood")
 	}
-	if _, _, failures := lim.checkLocked("192.0.2.15", "source"); failures != 1 {
-		t.Fatalf("expected 192.0.2.15 to remain in limiter, got failures=%d", failures)
+
+	// Now lock out all 5 slots with different lockout durations, then add a 6th locked IP:
+	// the one whose lockout expires soonest (198.51.100.1, 1s lockout) must be evicted in favor of longer lockouts (2s, 4s, 8s, 16s).
+	for idx, ip := range []string{"203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4"} {
+		failures := 6 + idx // 6->2s, 7->4s, 8->8s, 9->16s
+		for f := 0; f < failures; f++ {
+			lim.recordFailure(ip, "icecast_admin")
+		}
+	}
+	// All 5 entries in lim are now locked: 198.51.100.1 (1s) and 203.0.113.1..4 (2s..16s).
+	// Inserting a new IP must evict 198.51.100.1 (soonest lockout expiry: 1s) while preserving 203.0.113.1..4.
+	lim.recordFailure("203.0.113.99", "icecast_admin")
+	if locked, _, _ := lim.checkLocked("198.51.100.1", "icecast_admin"); locked {
+		t.Fatal("expected soonest-expiring locked entry 198.51.100.1 to be evicted when all slots are locked")
+	}
+	for _, ip := range []string{"203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4"} {
+		if locked, _, _ := lim.checkLocked(ip, "icecast_admin"); !locked {
+			t.Fatalf("expected longer-locked entry %s to remain locked", ip)
+		}
 	}
 
 	// Advance clock past TTL (31 minutes) and verify all idle entries are evicted.
 	now = now.Add(31 * time.Minute)
 	if got := lim.len(); got != 0 {
 		t.Fatalf("expected all idle entries to be TTL-evicted after 31m, got %d", got)
+	}
+
+	// 6. IPv6 /64 prefix grouping in limiter while keeping full IPv6 address in logs and source_ip.
+	var v6LogBuf safeBuffer
+	s.log = slog.New(slog.NewJSONHandler(&v6LogBuf, nil))
+	for i := 1; i <= 5; i++ {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+		req.Header.Set("X-Forwarded-For", "2001:db8:abcd:42::"+itoa(i))
+		req.SetBasicAuth("admin", "wrong-pass")
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = r.Body.Close()
+		if r.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("IPv6 attempt %d status=%d, want 401", i, r.StatusCode)
+		}
+	}
+	// A 6th attempt from a brand-new host address in the SAME /64 (2001:db8:abcd:42::beef) must be locked out (429).
+	reqV6Locked, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+	reqV6Locked.Header.Set("X-Forwarded-For", "2001:db8:abcd:42::beef")
+	reqV6Locked.SetBasicAuth("admin", "icecast-admin")
+	respV6Locked, err := http.DefaultClient.Do(reqV6Locked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respV6Locked.Body.Close()
+	if respV6Locked.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 for rotated host in locked IPv6 /64, got %d", respV6Locked.StatusCode)
+	}
+	// Verify a different /64 (2001:db8:abcd:43::1) is NOT locked out.
+	reqV6Other, _ := http.NewRequest(http.MethodGet, ts.URL+"/admin/stats", nil)
+	reqV6Other.Header.Set("X-Forwarded-For", "2001:db8:abcd:43::1")
+	reqV6Other.SetBasicAuth("admin", "icecast-admin")
+	respV6Other, err := http.DefaultClient.Do(reqV6Other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = respV6Other.Body.Close()
+	if respV6Other.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for different IPv6 /64, got %d", respV6Other.StatusCode)
+	}
+	// Verify logs and source_ip keep the full IPv6 address (not the /64 prefix).
+	if !strings.Contains(v6LogBuf.String(), `"ip":"2001:db8:abcd:42::beef"`) {
+		t.Fatalf("expected full IPv6 address in auth logs, got: %s", v6LogBuf.String())
+	}
+	v6SrcReq := newTestRequest(http.MethodPut, "http://radio.example/radio", nil)
+	v6SrcReq.RemoteAddr = "127.0.0.1:54321"
+	v6SrcReq.Header.Set("X-Forwarded-For", "2001:db8:abcd:42::cafe")
+	if gotIP := s.parseSourceStreamMetadata(v6SrcReq).SourceIP; gotIP != "2001:db8:abcd:42::cafe" {
+		t.Fatalf("IPv6 SourceIP=%q, want full address 2001:db8:abcd:42::cafe", gotIP)
+	}
+
+	// 7. totalFailures decay over 15m idle intervals and reset when the failing scope succeeds.
+	decayLim := newAuthLimiter()
+	decayNow := time.Now()
+	decayLim.nowFn = func() time.Time { return decayNow }
+
+	// Reach globalLockoutThreshold (15 failures) on "source" scope.
+	for i := 0; i < 15; i++ {
+		decayLim.recordFailure("198.51.100.77", "source")
+	}
+	if locked, _, _ := decayLim.checkLocked("198.51.100.77", "icecast_admin"); !locked {
+		t.Fatal("expected global ceiling to lock all scopes after 15 failures")
+	}
+	// Advance past lockout, then succeed on "source": clearing the "source" scope counter must reset totalFailures
+	// so a single subsequent failure does NOT re-trigger global lockout.
+	decayNow = decayNow.Add(16 * time.Minute)
+	decayLim.recordSuccess("198.51.100.77", "source")
+	decayLim.recordFailure("198.51.100.77", "source")
+	if locked, _, _ := decayLim.checkLocked("198.51.100.77", "icecast_admin"); locked {
+		t.Fatal("expected single failure after scope success not to trigger global lockout")
+	}
+
+	// Also verify time-based halving decay (every 15m of no failures halves failure counters) without any success call.
+	for i := 0; i < 16; i++ {
+		decayLim.recordFailure("198.51.100.88", "source")
+	}
+	// After 30 minutes (2 x 15m periods), 16 totalFailures halves twice to 4 (< 5 threshold and < 15 global threshold).
+	decayNow = decayNow.Add(30 * time.Minute)
+	if locked, _, failures := decayLim.checkLocked("198.51.100.88", "source"); locked || failures != 4 {
+		t.Fatalf("after 2 decay periods (30m): locked=%v failures=%d, want locked=false failures=4", locked, failures)
 	}
 }
 

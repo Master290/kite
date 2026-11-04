@@ -81,6 +81,7 @@ type Server struct {
 	StatusPageEnabled    *bool    `yaml:"status_page_enabled,omitempty" json:"status_page_enabled,omitempty"`
 	TrustedProxies       []string `yaml:"trusted_proxies,omitempty" json:"trusted_proxies,omitempty"`
 	TrustedProxyNetworks []string `yaml:"trusted_proxy_networks,omitempty" json:"trusted_proxy_networks,omitempty"`
+	IPv6PrefixBits       int      `yaml:"ipv6_prefix_bits,omitempty" json:"ipv6_prefix_bits,omitempty"`
 	IcecastAdminUser     string   `yaml:"icecast_admin_user,omitempty" json:"icecast_admin_user,omitempty"`
 	IcecastAdminPassword string   `yaml:"icecast_admin_password,omitempty" json:"icecast_admin_password,omitempty"`
 }
@@ -421,6 +422,12 @@ func (c *Config) Normalize(baseDir string) error {
 				return fmt.Errorf("invalid trusted proxy %q", entry)
 			}
 		}
+	}
+	if c.Server.IPv6PrefixBits == 0 {
+		c.Server.IPv6PrefixBits = 64
+	}
+	if c.Server.IPv6PrefixBits < 1 || c.Server.IPv6PrefixBits > 128 {
+		return errors.New("ipv6_prefix_bits must be between 1 and 128")
 	}
 	if c.Defaults.SourceTimeout == 0 {
 		c.Defaults.SourceTimeout = Duration(3 * time.Second)
